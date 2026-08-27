@@ -72,6 +72,16 @@ TypeScript source for source maps) and is consumed through a bundler
 runtime dependency. React is an optional peer dependency for the hook;
 `@prisma/internals` is an optional peer dependency for the codegen CLI.
 
+Installing straight from git (`github:nightridefm/localdb`) also works:
+a `prepare` script builds `dist/` at install time. pnpm 10+ blocks
+git-dependency build scripts by default, so allowlist the package once
+in the consumer's `pnpm-workspace.yaml`:
+
+```yaml
+onlyBuiltDependencies:
+  - '@nightride/localdb'
+```
+
 ## Quick start
 
 ### 1. Generate model metadata (optional but recommended)

@@ -65,7 +65,8 @@
     "bench:types": "node bench/type-fidelity-bench.mjs",
     "generate:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts",
     "check:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts --check",
-    "prepublishOnly": "pnpm check && pnpm lint && pnpm test && pnpm build"
+    "prepare": "node scripts/build-dist.mjs",
+    "prepublishOnly": "pnpm check && pnpm lint && pnpm test"
   },
   "dependencies": {
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
