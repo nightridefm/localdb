@@ -81,6 +81,12 @@ export type QueryResult<Row = unknown> = {
   commitSeq: number;
   /** Transferred payload size for this delivery (diagnostics/benching). */
   byteLength: number;
+  /**
+   * Set when the query's last run failed (SQL error, torn topology). The
+   * rows are the last good result (empty if there never was one); the
+   * field clears on the next successful delivery.
+   */
+  error?: string;
 };
 
 export type Unsubscribe = () => void;

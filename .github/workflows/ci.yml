@@ -17,5 +17,27 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      - run: pnpm lint
+      - run: pnpm format:check
       - run: pnpm check:example-models
       - run: pnpm test
+      # The publishable dist must always build (JS + d.ts with rewritten
+      # import specifiers - scripts/build-dist.mjs fails on any leftovers).
+      - run: pnpm build
+
+  # Browser end-to-end: the real OPFS VFS, fence, worker topology, and
+  # reactive lifecycle in headless Chrome, across all three connection
+  # tiers (multi / baton / single via forceConnMode). See
+  # harness/run-smoke.mjs for the asserted scenario.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:smoke
+      - run: pnpm smoke

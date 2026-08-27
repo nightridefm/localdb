@@ -88,7 +88,24 @@ function persistCursor(table: string, cursor: ShapeCursor): void {
 			 ON CONFLICT(table_name) DO UPDATE SET offset_v=excluded.offset_v, handle=excluded.handle`
     );
   }
-  cursorUpsertStmt.bind([shapeCursorKey(table), cursor.offset, cursor.handle]).stepReset();
+  const s = cursorUpsertStmt;
+  try {
+    s.bind([shapeCursorKey(table), cursor.offset, cursor.handle]).stepReset();
+  } catch (err) {
+    // A failed bind/step keeps bindings attached and the next bind() dies
+    // with SQLITE_MISUSE - reset, or drop the cached statement entirely.
+    try {
+      s.reset();
+    } catch {
+      cursorUpsertStmt = null;
+      try {
+        s.finalize();
+      } catch {
+        // already finalized
+      }
+    }
+    throw err;
+  }
 }
 function runBound(sql: string, values: (string | number | null)[]): void {
   const s = engine!.db.prepare(sql);
@@ -371,6 +388,10 @@ let visLockRelease: (() => void) | null = null;
 let visBc: BroadcastChannel | null = null;
 let syncRunning = false;
 let syncConfig: WriterInit | null = null;
+// Manual pause (LocalDb.pauseSync). Per-tab: it stops THIS tab's sync
+// engine and overrides the visibility census until resumeSync. A standby
+// just records the flag and honours it if promoted.
+let manualPause = false;
 
 function setVisibleLock(visible: boolean, dbName: string): void {
   if (visible && !visLockRelease) {
@@ -406,7 +427,7 @@ function stopSync(): void {
 }
 
 async function evaluatePause(): Promise<void> {
-  if (!isLeader || !pauseWhenHidden || !syncConfig) return;
+  if (!isLeader || !pauseWhenHidden || !syncConfig || manualPause) return;
   // Give the visibility lock transfer a beat to settle before querying.
   await new Promise((r) => setTimeout(r, 50));
   const visible = await anyTabVisible(syncConfig.dbName);
@@ -501,6 +522,7 @@ async function init(config: WriterInit) {
     readService = new ReadService(engine!, fence, post, {
       readMode: config.readMode,
       advise: config.advise,
+      maxUpdateHz: config.maxUpdateHz,
     });
   }
 
@@ -516,6 +538,12 @@ async function init(config: WriterInit) {
 		`);
     const stored = engine!.db.selectValue(`SELECT value FROM _ldb_meta WHERE key='schema_version'`);
     if (stored !== undefined && stored !== null && Number(stored) !== config.schemaVersion) {
+      // During a deploy rollout, tabs on DIFFERENT app versions wipe on
+      // every boot until the old tabs reload - loud so a wipe loop in the
+      // console reads as "stale tab open", not data loss.
+      console.warn(
+        `[localdb] ${config.dbName}: schema version ${stored} != ${config.schemaVersion} - wiping local cache (a tab on another app version will wipe it back until reloaded)`
+      );
       engine!.dropUserTables();
       engine!.db.exec(`DELETE FROM _ldb_shape;`);
       wiped = true;
@@ -538,7 +566,7 @@ async function init(config: WriterInit) {
     isLeader = true;
     leaseLogged = true;
     console.info(`[localdb] ${config.dbName}: sync leader - THIS tab owns the Electric streams`);
-    if (pauseWhenHidden && !(await anyTabVisible(config.dbName))) {
+    if (manualPause || (pauseWhenHidden && !(await anyTabVisible(config.dbName)))) {
       postStatus({ state: 'paused' });
     } else {
       startSync();
@@ -765,10 +793,19 @@ onmessage = (ev: MessageEvent<ToWriter | Exclude<ToReader, { t: 'r-init' }>>) =>
   if (m.t === 'init') {
     void init(m.config).catch(fail);
   } else if (m.t === 'pause') {
-    abort.abort();
+    manualPause = true;
+    // Leader: stop the streams now (stopSync posts 'paused'; a no-op if
+    // the census already paused them). Standby: the flag alone suffices -
+    // it is honoured on promotion.
+    if (isLeader) stopSync();
   } else if (m.t === 'resume') {
-    abort = new AbortController();
-    // TODO: re-run shapes with stored cursors.
+    manualPause = false;
+    if (isLeader) {
+      // Hand the decision back to the census when it is active; otherwise
+      // restart directly. startSync resumes from the stored cursors.
+      if (pauseWhenHidden) void evaluatePause();
+      else startSync();
+    }
   } else if (m.t === 'subscribe') {
     // single mode: reads are hosted here (SAHPool allows one connection).
     if (readService) void readService.subscribe(m.key, m.spec).catch(fail);

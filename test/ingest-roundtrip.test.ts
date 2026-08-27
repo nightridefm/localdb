@@ -10,11 +10,10 @@
 // of arrays/objects.
 import assert from 'node:assert/strict';
 
-import { initSqlite } from './init-sqlite.ts';
-
 import { ddlFor, models, rowJson } from '../examples/models.ts';
 import { makeApplier } from '../src/sync/apply.ts';
 import { embedExpr, embedHints } from '../src/worker/engine.ts';
+import { initSqlite } from './init-sqlite.ts';
 
 const sqlite3 = await initSqlite();
 const db = new sqlite3.oo1.DB(':memory:');

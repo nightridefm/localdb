@@ -34,7 +34,10 @@ import type { Engine, Sqlite3Stmt } from '../worker/engine.ts';
 import type { ShapeMessage } from './electric.ts';
 
 /** The subset of ModelMeta the ingest path needs (see LocalDbConfig.models). */
-export type ColumnMeta = Pick<ModelMeta, 'boolColumns' | 'jsonColumns' | 'listColumns'>;
+export type ColumnMeta = Pick<
+  ModelMeta,
+  'dateColumns' | 'boolColumns' | 'jsonColumns' | 'listColumns'
+>;
 
 export type TableApplier = {
   table: string;
@@ -207,6 +210,16 @@ function normJson(v: unknown): string | number | null {
   if (v === null || v === undefined) return null;
   return typeof v === 'string' ? v : JSON.stringify(v);
 }
+// Metadata-declared NON-date columns: no timestamp sniffing. A TEXT column
+// whose value happens to look like a Postgres timestamp ('2024-01-01
+// 10:00:00+02' in a title) must arrive verbatim, not rewritten to ISO -
+// only declared dateColumns get normalizeValue's timestamp path.
+function normPlain(v: unknown): string | number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  return String(v);
+}
 
 /**
  * Per-COLUMN coercion function for a table, resolved once per column
@@ -214,14 +227,27 @@ function normJson(v: unknown): string | number | null {
  * array of these up front, so the inner cell loop is a bare indexed call
  * - no Set probes, no string-keyed dispatch (measurable across the ~20M
  * cells of a 1M-row hydration).
+ *
+ * Without metadata every text cell goes through normalizeValue's
+ * timestamp heuristic (there is nothing better to go on); with metadata
+ * the heuristic is scoped to the declared dateColumns.
  */
 export function columnNormalizers(meta?: ColumnMeta): (c: string) => NormalizeFn {
   if (!meta) return () => normalizeValue;
+  const date = new Set(meta.dateColumns);
   const bool = new Set(meta.boolColumns);
   const json = new Set(meta.jsonColumns);
   const list = new Set(meta.listColumns);
   return (c) =>
-    bool.has(c) ? normBool : list.has(c) ? normList : json.has(c) ? normJson : normalizeValue;
+    bool.has(c)
+      ? normBool
+      : list.has(c)
+        ? normList
+        : json.has(c)
+          ? normJson
+          : date.has(c)
+            ? normalizeValue
+            : normPlain;
 }
 
 /**

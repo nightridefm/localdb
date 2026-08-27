@@ -55,6 +55,11 @@ assert.equal(plNorm('show_on_home', null), null);
 // Non-boolean columns on the same table keep normal handling.
 assert.equal(plNorm('name', 'true'), 'true');
 assert.equal(plNorm('created_at', '2026-07-03 12:41:13.736'), '2026-07-03T12:41:13.736Z');
+// The timestamp heuristic is scoped to DECLARED dateColumns when metadata
+// exists: a TEXT column whose value merely looks like a timestamp must
+// arrive verbatim, not rewritten to ISO.
+assert.equal(plNorm('name', '2026-07-03 14:41:13.736+02'), '2026-07-03 14:41:13.736+02');
+assert.equal(plNorm('name', '2026-07-03 12:41:13'), '2026-07-03 12:41:13');
 
 const artistNorm = makeColumnNormalizer(models.artist);
 // JSON column: parsed values stringify, JSON text passes through.
@@ -72,6 +77,8 @@ assert.equal(trackNorm('beats', [0.1, 0.25]), '[0.1,0.25]');
 // Missing metadata degrades to generic normalization, never throws.
 const bareNorm = makeColumnNormalizer();
 assert.equal(bareNorm('anything', 't'), 't');
+// Without metadata the timestamp heuristic applies to every text cell.
+assert.equal(bareNorm('name', '2026-07-03 12:41:13'), '2026-07-03T12:41:13.000Z');
 
 // ── name-collision guard (validateModels) ───────────────────────────────
 // The engine's delivery layer maps result-column NAMES to bool/json

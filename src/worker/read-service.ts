@@ -32,7 +32,7 @@ type Post = (m: FromReader, transfer?: Transferable[]) => void;
 
 export type ReadMode = 'fence' | 'seqlock';
 
-const TICK_VISIBLE_MS = 100;
+const DEFAULT_MAX_UPDATE_HZ = 10;
 const TICK_HIDDEN_MS = 1000;
 const SEQLOCK_MAX_ATTEMPTS = 4;
 
@@ -40,7 +40,11 @@ export class ReadService {
   private registry = new QueryRegistry();
   private commitSeq = 0;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
-  private tickIntervalMs = TICK_VISIBLE_MS;
+  /** Visible-tab tick interval, from LocalDbConfig.maxUpdateHz. */
+  private tickVisibleMs: number;
+  /** Hidden tabs tick at 1Hz (never faster than the visible rate). */
+  private tickHiddenMs: number;
+  private tickIntervalMs: number;
   // Re-entrancy guard: runTick captures its `due` list up front, so a
   // subscribe/commit landing mid-tick (fence mode awaits) would otherwise
   // be missed by the in-flight pass AND run concurrently by a second one.
@@ -56,11 +60,15 @@ export class ReadService {
     private engine: Engine,
     private fence: string,
     private post: Post,
-    private opts: { readMode?: ReadMode; advise?: boolean } = {}
+    private opts: { readMode?: ReadMode; advise?: boolean; maxUpdateHz?: number } = {}
   ) {
     // Baton mode forces fence reads: the OPFS handle only exists inside a
     // fence window, so lock-free seqlock reads are structurally impossible.
     this.mode = engine.baton ? 'fence' : (opts.readMode ?? 'fence');
+    const hz = opts.maxUpdateHz && opts.maxUpdateHz > 0 ? opts.maxUpdateHz : DEFAULT_MAX_UPDATE_HZ;
+    this.tickVisibleMs = Math.max(1, Math.round(1000 / hz));
+    this.tickHiddenMs = Math.max(TICK_HIDDEN_MS, this.tickVisibleMs);
+    this.tickIntervalMs = this.tickVisibleMs;
   }
 
   /** Shared-fence + (baton) handle window around a batch of db reads. */
@@ -86,7 +94,7 @@ export class ReadService {
    * after becoming visible fires immediately if anything is dirty.
    */
   setHidden(hidden: boolean): void {
-    this.tickIntervalMs = hidden ? TICK_HIDDEN_MS : TICK_VISIBLE_MS;
+    this.tickIntervalMs = hidden ? this.tickHiddenMs : this.tickVisibleMs;
     if (!hidden && this.tickTimer) {
       clearTimeout(this.tickTimer);
       this.tickTimer = null;

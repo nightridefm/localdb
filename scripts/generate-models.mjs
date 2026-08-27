@@ -13,7 +13,7 @@
 //   generate-models <schema.prisma> <out.ts> [--lib <import>] [--check]
 //
 //   --lib    import specifier for the localdb package in the emitted file
-//            (default: 'localdb')
+//            (default: '@nightride/localdb')
 //   --check  regenerate in memory and fail if <out.ts> is stale
 //
 // DDL policy: the local DB is a DISPOSABLE SYNC CACHE. Only primary-key
@@ -29,7 +29,7 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const check = args.includes('--check');
 const libIdx = args.indexOf('--lib');
-const lib = libIdx >= 0 ? args[libIdx + 1] : 'localdb';
+const lib = libIdx >= 0 ? args[libIdx + 1] : '@nightride/localdb';
 const positional = args.filter((a, i) => !a.startsWith('--') && (libIdx < 0 || i !== libIdx + 1));
 const [schemaPath, outPath] = positional;
 
@@ -170,7 +170,7 @@ if (check) {
     console.error(
       `generate-models: ${outPath} is STALE with respect to ${schemaPath}.\n` +
         `Regenerate it with:  generate-models ${schemaPath} ${outPath}` +
-        (lib === 'localdb' ? '' : ` --lib ${lib}`)
+        (lib === '@nightride/localdb' ? '' : ` --lib ${lib}`)
     );
     process.exit(1);
   }

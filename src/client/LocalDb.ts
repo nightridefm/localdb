@@ -65,6 +65,11 @@ export class LocalDb {
   /** Reader index a subscription is pinned to (table affinity). */
   private subReader = new Map<QueryKey, number>();
   private statusListeners = new Set<(s: SyncStatus) => void>();
+  /** Last status seen - replayed to late onSyncStatus subscribers. */
+  private lastStatus: SyncStatus | null = null;
+  /** Set on a terminal 'unsupported' status - all reads fail fast from then on. */
+  private terminalError: Error | null = null;
+  private destroyed = false;
   private adviceListeners = new Set<(a: { key: QueryKey; sql: string; notes: string[] }) => void>();
   private visibilityHandler: (() => void) | null = null;
   private queryId = 0;
@@ -72,7 +77,10 @@ export class LocalDb {
     number,
     { resolve: (rows: unknown[]) => void; reject: (e: Error) => void }
   >();
-  private pendingAnalyze = new Map<number, (report: AnalyzeEntry[]) => void>();
+  private pendingAnalyze = new Map<
+    number,
+    { resolve: (report: AnalyzeEntry[]) => void; reject: (e: Error) => void }
+  >();
   /**
    * Every distinct query this session (subscriptions + one-shots), with
    * the latest params - the corpus for analyze(). Capped; oldest evicted.
@@ -92,7 +100,17 @@ export class LocalDb {
   private rr = 0;
   private readyPromise: Promise<void>;
   private readyResolve!: () => void;
+  private readyReject!: (e: Error) => void;
   private readersReady = 0;
+  /**
+   * Reader-pool supervision. `poolGeneration` invalidates handlers of
+   * terminated workers (their queued events must not touch the fresh
+   * pool); `poolFailures` counts consecutive respawns without a full
+   * r-ready, capping the crash loop before declaring the environment
+   * unsupported.
+   */
+  private poolGeneration = 0;
+  private poolFailures = 0;
 
   // One-shot batching: queries issued within a microtask ship together.
   private oneShotQueue: Array<{ id: number; sql: string; params?: QuerySpec['params'] }> = [];
@@ -117,15 +135,23 @@ export class LocalDb {
     // silently mis-typed rows later.
     if (config.models) validateModels(config.models);
     this.writer = workers.writer;
-    this.readyPromise = new Promise<void>((r) => (this.readyResolve = r));
+    this.readyPromise = new Promise<void>((res, rej) => {
+      this.readyResolve = res;
+      this.readyReject = rej;
+    });
+    // The registered handler marks a terminal rejection as handled for
+    // apps that never await ready(); callers who do still see it.
+    this.readyPromise.catch(() => {});
 
     // A writer worker that dies before posting anything (wasm load
     // failure, CSP, OOM) would otherwise leave the app on an infinite
     // spinner - surface it as the terminal unsupported status.
     this.writer.onerror = (e: ErrorEvent) => {
-      for (const l of this.statusListeners) {
-        l({ state: 'unsupported', reason: 'worker-failed', error: e.message || 'worker crashed' });
-      }
+      this.emitStatus({
+        state: 'unsupported',
+        reason: 'worker-failed',
+        error: e.message || 'worker crashed',
+      });
     };
     this.writer.onmessage = (e: MessageEvent<FromWriter | FromReader>) => {
       const m = e.data;
@@ -135,13 +161,11 @@ export class LocalDb {
         else {
           // SAHPool: one connection per file, so the pre-spawned pool can
           // never open it. Tear it down and host reads on the writer.
-          for (const r of this.readers) r.terminate();
-          this.readers = [];
-          this.readerLoad = [];
+          this.terminatePool();
           this.flushOutbox();
         }
       } else if (m.t === 'status') {
-        for (const l of this.statusListeners) l(m.status);
+        this.emitStatus(m.status);
       } else if (m.t === 'error') {
         console.error('[localdb writer]', m.error);
       } else if (m.t !== 'commit') {
@@ -164,6 +188,7 @@ export class LocalDb {
         alignShapes: config.alignShapes,
         readMode: config.readMode,
         advise: config.advise,
+        maxUpdateHz: config.maxUpdateHz,
         fts: config.fts,
         shapes: config.shapes,
         models: config.models,
@@ -201,15 +226,81 @@ export class LocalDb {
 
   /** Create the worker objects (no r-init yet - the mode isn't known). */
   private spawnPool(): void {
+    // Handlers are bound to THIS pool generation: a terminated worker's
+    // queued events (late results, a crash racing a repool) must never
+    // touch the replacement pool's bookkeeping.
+    const gen = this.poolGeneration;
     const n = this.poolSize();
     for (let i = 0; i < n; i++) {
       const w = this.workers.spawnReader();
       this.readers.push(w);
       this.readerLoad.push(0);
       w.onmessage = (e: MessageEvent<FromReader>) => {
+        if (gen !== this.poolGeneration) return;
         if (e.data.t === 'r-ready') this.onReaderReady();
         else this.onReaderMessage(e.data);
       };
+      w.onerror = (e: ErrorEvent) => {
+        this.onReaderFailure(gen, e.message || 'reader worker crashed');
+      };
+    }
+  }
+
+  /** Terminate every pool member and invalidate their handlers. */
+  private terminatePool(): void {
+    this.poolGeneration++;
+    for (const r of this.readers) r.terminate();
+    this.readers = [];
+    this.readerLoad = [];
+    this.subReader.clear();
+    this.readersReady = 0;
+  }
+
+  /**
+   * A reader worker died (boot failure or runtime crash). The pool is
+   * rebuilt wholesale - the same path a park/unpark takes - and live
+   * subscriptions are replayed onto the fresh workers. In-flight one-shots
+   * died with their worker and are rejected. Repeated failures without an
+   * intervening healthy pool mean the environment cannot run readers at
+   * all: give up loudly instead of crash-looping.
+   */
+  private onReaderFailure(gen: number, error: string): void {
+    if (this.destroyed || this.terminalError || gen !== this.poolGeneration) return;
+    if (this.parked || this.connMode === 'single') return;
+    console.error('[localdb] reader worker failed:', error);
+    this.poolFailures++;
+    if (this.poolFailures > 3) {
+      this.terminatePool();
+      this.emitStatus({
+        state: 'unsupported',
+        reason: 'worker-failed',
+        error: `reader workers failed repeatedly: ${error}`,
+      });
+      return;
+    }
+    console.warn(`[localdb] respawning reader pool (attempt ${this.poolFailures}/3)`);
+    this.topologyReady = false;
+    this.terminatePool();
+    // Only IN-FLIGHT one-shots are lost; queued ones re-route after respawn.
+    for (const [id] of this.queryReader) {
+      const p = this.pendingQueries.get(id);
+      if (p) {
+        this.pendingQueries.delete(id);
+        p.reject(new Error('reader pool restarted'));
+      }
+    }
+    this.queryReader.clear();
+    // Analyze runs on a specific reader - any in flight died with it.
+    for (const [, p] of this.pendingAnalyze) p.reject(new Error('reader pool restarted'));
+    this.pendingAnalyze.clear();
+    this.spawnPool();
+    if (this.connMode === 'multi' || this.connMode === 'baton') this.initReaders();
+    // Replay live subscriptions onto the new pool. Queued (un)subscribes
+    // were aimed at the dead workers - drop them so registry subscriber
+    // counts stay 1:1 with client-side subscriptions.
+    this.outbox = this.outbox.filter((m) => m.t !== 'subscribe' && m.t !== 'unsubscribe');
+    for (const [key, sub] of this.subs) {
+      this.routeReaderMsg({ t: 'subscribe', key, spec: sub.spec });
     }
   }
 
@@ -223,6 +314,7 @@ export class LocalDb {
         connMode: this.connMode === 'baton' ? 'baton' : 'multi',
         readMode: this.config.readMode,
         advise: this.config.advise,
+        maxUpdateHz: this.config.maxUpdateHz,
         models: this.config.models,
       } satisfies ToReader);
     }
@@ -230,6 +322,7 @@ export class LocalDb {
 
   private onReaderReady(): void {
     if (++this.readersReady < this.readers.length) return;
+    this.poolFailures = 0; // the pool proved healthy - reset the crash cap
     // Push the INITIAL state (visible or hidden) so the census is seeded.
     this.visibilityHandler?.();
     this.flushOutbox();
@@ -269,14 +362,13 @@ export class LocalDb {
     this.parked = true;
     // New read traffic queues in the outbox until the pool is back.
     this.topologyReady = false;
-    for (const r of this.readers) r.terminate();
-    this.readers = [];
-    this.readerLoad = [];
-    this.subReader.clear();
+    this.terminatePool();
     // In-flight one-shots can never be answered by a terminated worker.
     for (const [, p] of this.pendingQueries) p.reject(new Error('reader pool parked'));
     this.pendingQueries.clear();
     this.queryReader.clear();
+    for (const [, p] of this.pendingAnalyze) p.reject(new Error('reader pool parked'));
+    this.pendingAnalyze.clear();
     console.info('[localdb] reader pool parked (tab hidden); will respawn on unhide');
   }
 
@@ -290,6 +382,54 @@ export class LocalDb {
       this.routeReaderMsg({ t: 'subscribe', key, spec: sub.spec });
     }
     console.info('[localdb] reader pool respawned (tab visible)');
+  }
+
+  /** Record + fan out a status; a terminal 'unsupported' fails all reads. */
+  private emitStatus(status: SyncStatus): void {
+    if (this.destroyed) return;
+    this.lastStatus = status;
+    for (const l of this.statusListeners) l(status);
+    if (status.state === 'unsupported') this.onTerminal(status);
+  }
+
+  /**
+   * Terminal environment failure (no OPFS, storage init failed, workers
+   * keep dying): nothing will ever serve a read again. Settle everything
+   * that is waiting - ready(), pending one-shots and analyzes - and hand
+   * every live subscription an error result, so no caller is left on an
+   * infinite spinner.
+   */
+  private onTerminal(status: SyncStatus & { state: 'unsupported' }): void {
+    if (this.terminalError) return;
+    this.terminalError = new Error(
+      `localdb unsupported (${status.reason})${status.error ? `: ${status.error}` : ''}`
+    );
+    this.readyReject(this.terminalError);
+    for (const [, p] of this.pendingQueries) p.reject(this.terminalError);
+    this.pendingQueries.clear();
+    this.queryReader.clear();
+    for (const [, p] of this.pendingAnalyze) p.reject(this.terminalError);
+    this.pendingAnalyze.clear();
+    this.outbox = [];
+    for (const sub of this.subs.values()) this.deliverError(sub, this.terminalError.message);
+  }
+
+  /**
+   * Error delivery to a subscription: the previous good rows stay (a
+   * transient failure must not blank the screen), `error` is set, and the
+   * next successful result clears it by replacing the snapshot.
+   */
+  private deliverError(sub: Subscription, error: string): void {
+    const prev = sub.snapshot;
+    sub.snapshot = {
+      rows: prev?.rows ?? [],
+      version: prev?.version ?? 0,
+      commitSeq: prev?.commitSeq ?? 0,
+      byteLength: 0,
+      error,
+    };
+    this.pendingDeliveries.add(sub);
+    this.scheduleDelivery();
   }
 
   private onReaderMessage(m: FromReader): void {
@@ -340,10 +480,10 @@ export class LocalDb {
       }
       this.scheduleDelivery();
     } else if (m.t === 'r-analyze') {
-      const resolve = this.pendingAnalyze.get(m.id);
-      if (resolve) {
+      const p = this.pendingAnalyze.get(m.id);
+      if (p) {
         this.pendingAnalyze.delete(m.id);
-        resolve(m.report);
+        p.resolve(m.report);
       }
     } else if (m.t === 'r-advice') {
       for (const l of this.adviceListeners) l({ key: m.key, sql: m.sql, notes: m.notes });
@@ -362,6 +502,12 @@ export class LocalDb {
       }
     } else if (m.t === 'r-error') {
       console.error('[localdb reader]', m.key ?? '', m.error);
+      // A keyed error belongs to a subscription - deliver it so the app
+      // can react (useLiveQuery surfaces it) instead of loading forever.
+      if (m.key) {
+        const sub = this.subs.get(m.key);
+        if (sub) this.deliverError(sub, m.error);
+      }
     }
   }
 
@@ -459,6 +605,11 @@ export class LocalDb {
     return this.readyPromise;
   }
 
+  /** Resolved connection tier ('multi' | 'baton' | 'single'); null before ready. */
+  getConnMode(): 'multi' | 'baton' | 'single' | null {
+    return this.connMode;
+  }
+
   /**
    * Reactive subscription. The callback fires with the current snapshot as
    * soon as it exists, then on every CHANGED result (worker-side hash
@@ -475,7 +626,8 @@ export class LocalDb {
     if (!sub) {
       sub = { key, spec, listeners: new Set(), snapshot: null, deltaCache: null, deltaOrder: null };
       this.subs.set(key, sub);
-      this.routeReaderMsg({ t: 'subscribe', key, spec });
+      if (this.terminalError) this.deliverError(sub, this.terminalError.message);
+      else this.routeReaderMsg({ t: 'subscribe', key, spec });
     }
     sub.listeners.add(listener as Listener);
     if (sub.snapshot) (listener as Listener)(sub.snapshot);
@@ -503,6 +655,8 @@ export class LocalDb {
    * queries pays one acquisition, not six.
    */
   query<Row = unknown>(sql: string, params?: QuerySpec['params']): Promise<Row[]> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.destroyed) return Promise.reject(new Error('LocalDb destroyed'));
     this.recordQuery(sql, params);
     const id = ++this.queryId;
     return new Promise<Row[]>((resolve, reject) => {
@@ -527,10 +681,12 @@ export class LocalDb {
    * cannot validate index choices.
    */
   analyze(): Promise<AnalyzeEntry[]> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    if (this.destroyed) return Promise.reject(new Error('LocalDb destroyed'));
     const queries = [...this.recorded.values()];
     const id = ++this.queryId;
-    return new Promise<AnalyzeEntry[]>((resolve) => {
-      this.pendingAnalyze.set(id, resolve);
+    return new Promise<AnalyzeEntry[]>((resolve, reject) => {
+      this.pendingAnalyze.set(id, { resolve, reject });
       this.routeReaderMsg({ t: 'analyze', id, queries });
     });
   }
@@ -543,20 +699,53 @@ export class LocalDb {
 
   onSyncStatus(l: (s: SyncStatus) => void): Unsubscribe {
     this.statusListeners.add(l);
+    // Replay the current state so a listener attached after a status
+    // landed (including a terminal 'unsupported') still sees it. Async so
+    // the subscribe call returns before the first invocation.
+    if (this.lastStatus) {
+      const s = this.lastStatus;
+      queueMicrotask(() => {
+        if (this.statusListeners.has(l)) l(s);
+      });
+    }
     return () => this.statusListeners.delete(l);
   }
 
+  /**
+   * Pause Electric sync for THIS tab's writer (reads keep serving the
+   * local data). If this tab is the sync leader, the shape streams stop;
+   * a standby records the flag and honours it if promoted. Resume
+   * restarts from the stored cursors. Overrides pauseSyncWhenHidden's
+   * census until resumeSync().
+   */
+  pauseSync(): void {
+    this.send(this.writer, { t: 'pause' });
+  }
+
+  resumeSync(): void {
+    this.send(this.writer, { t: 'resume' });
+  }
+
   destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
     if (this.visibilityHandler)
       document.removeEventListener('visibilitychange', this.visibilityHandler);
     if (this.parkTimer) clearTimeout(this.parkTimer);
     this.writer.terminate();
-    for (const r of this.readers) r.terminate();
-    this.readers = [];
-    this.readerLoad = [];
+    this.terminatePool();
     this.subs.clear();
-    this.subReader.clear();
+    // Settle every outstanding promise - nothing can answer them now.
+    const gone = new Error('LocalDb destroyed');
+    for (const [, p] of this.pendingQueries) p.reject(gone);
     this.pendingQueries.clear();
+    for (const [, p] of this.pendingAnalyze) p.reject(gone);
+    this.pendingAnalyze.clear();
+    this.queryReader.clear();
+    this.outbox = [];
+    this.pendingDeliveries.clear();
+    this.statusListeners.clear();
+    this.adviceListeners.clear();
   }
 
   private send(w: Worker, m: ToWriter): void {

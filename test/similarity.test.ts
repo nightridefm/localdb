@@ -4,14 +4,13 @@
 // for: cross-field "Artist Title" queries, typos, and word reordering.
 import assert from 'node:assert/strict';
 
-import { initSqlite } from './init-sqlite.ts';
-
 import {
   registerSimilarityUdf,
   searchSimilarity,
   trigramSimilarity,
   wordSimilarity,
 } from '../src/similarity.ts';
+import { initSqlite } from './init-sqlite.ts';
 
 // ── pure function ──────────────────────────────────────────────────────
 // Values cross-checked against Postgres pg_trgm (SELECT similarity(...)).

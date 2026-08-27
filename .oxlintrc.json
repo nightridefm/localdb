@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "dist/**",
+    "test/.build/**",
+    "smoke/dist/**",
+    "bench/.build/**",
+    "bench/dist/**",
+    "examples/models.ts"
+  ],
+  "categories": {
+    "correctness": "warn"
+  },
+  "plugins": [
+    "typescript",
+    "eslint",
+    "import",
+    "promise",
+    "node",
+    "react",
+    "react-perf",
+    "unicorn",
+    "oxc",
+    "jsx-a11y"
+  ],
+  "rules": {
+    "eslint/no-unused-vars": "error",
+    "unicorn/no-array-for-each": "warn",
+    // The whole library deliberately String()s unknown values coming out
+    // of SQLite / UDF arguments - these two rules flag every such site.
+    "typescript/no-base-to-string": "off",
+    "typescript/restrict-template-expressions": "off"
+  }
+}

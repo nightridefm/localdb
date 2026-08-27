@@ -50,7 +50,10 @@ function artistWire(i) {
     values: rows.length * cols.length,
     plain_mvals_per_s: plain.mvals_per_s,
     column_aware_mvals_per_s: aware.mvals_per_s,
-    aware_vs_plain_pct: +(((aware.mvals_per_s - plain.mvals_per_s) / plain.mvals_per_s) * 100).toFixed(1),
+    aware_vs_plain_pct: +(
+      ((aware.mvals_per_s - plain.mvals_per_s) / plain.mvals_per_s) *
+      100
+    ).toFixed(1),
   };
   console.log('1. normalizer      ', JSON.stringify(results.normalizer));
 }
@@ -66,7 +69,12 @@ const engine = { db };
 
 // 2 ── full applier ingest A/B ───────────────────────────────────────────
 function ingest(table) {
-  const applier = makeApplier(engine, table, ['id'], table === 'artist' ? models.artist : undefined);
+  const applier = makeApplier(
+    engine,
+    table,
+    ['id'],
+    table === 'artist' ? models.artist : undefined
+  );
   const msgs = Array.from({ length: N_ARTIST }, (_, i) => ({
     headers: { operation: 'insert' },
     value: artistWire(i),
@@ -85,7 +93,10 @@ function ingest(table) {
     rows: N_ARTIST,
     plain_rows_per_s: plain.rows_per_s,
     coerced_rows_per_s: coerced.rows_per_s,
-    coerced_vs_plain_pct: +(((coerced.rows_per_s - plain.rows_per_s) / plain.rows_per_s) * 100).toFixed(1),
+    coerced_vs_plain_pct: +(
+      ((coerced.rows_per_s - plain.rows_per_s) / plain.rows_per_s) *
+      100
+    ).toFixed(1),
   };
   console.log('2. applier ingest  ', JSON.stringify(results.applier_ingest));
 }
@@ -124,7 +135,10 @@ function readBench(inner, iters) {
     out[label + '_p50_ms'] = +p50(times).toFixed(2);
     out.bytes = bytes;
   }
-  out.typed_vs_plain_pct = +(((out.typed_p50_ms - out.plain_p50_ms) / out.plain_p50_ms) * 100).toFixed(1);
+  out.typed_vs_plain_pct = +(
+    ((out.typed_p50_ms - out.plain_p50_ms) / out.plain_p50_ms) *
+    100
+  ).toFixed(1);
   return out;
 }
 {
@@ -153,7 +167,9 @@ function readBench(inner, iters) {
     typed_p50_ms: +p50(times.typed).toFixed(2),
   };
   results.rowjson_5k.typed_vs_plain_pct = +(
-    ((results.rowjson_5k.typed_p50_ms - results.rowjson_5k.plain_p50_ms) / results.rowjson_5k.plain_p50_ms) * 100
+    ((results.rowjson_5k.typed_p50_ms - results.rowjson_5k.plain_p50_ms) /
+      results.rowjson_5k.plain_p50_ms) *
+    100
   ).toFixed(1);
   console.log('4. rowJson 5k rows ', JSON.stringify(results.rowjson_5k));
 }

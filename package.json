@@ -1,46 +1,87 @@
 {
-  "name": "localdb",
+  "name": "@nightride/localdb",
   "version": "0.1.0",
   "description": "Reactive local-first SQLite for the browser: ElectricSQL shape sync into an OPFS-backed sqlite-wasm database, with worker read pools, live queries, and multi-tab support",
-  "license": "MIT",
-  "packageManager": "pnpm@10.27.0",
-  "type": "module",
   "keywords": [
-    "sqlite",
-    "wasm",
-    "opfs",
     "electric-sql",
-    "local-first",
-    "sync",
     "live-queries",
-    "react"
+    "local-first",
+    "opfs",
+    "react",
+    "sqlite",
+    "sync",
+    "wasm"
   ],
-  "exports": {
-    ".": "./src/index.ts",
-    "./react": "./src/client/react.ts",
-    "./writer.worker": "./src/worker/writer.worker.ts",
-    "./reader.worker": "./src/worker/reader.worker.ts"
+  "homepage": "https://github.com/nightridefm/localdb#readme",
+  "bugs": {
+    "url": "https://github.com/nightridefm/localdb/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nightridefm/localdb.git"
   },
   "bin": {
     "localdb-generate-models": "scripts/generate-models.mjs"
   },
   "files": [
+    "dist",
     "src",
     "scripts/generate-models.mjs"
   ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/client/react.d.ts",
+      "default": "./dist/client/react.js"
+    },
+    "./writer.worker": {
+      "types": "./dist/worker/writer.worker.d.ts",
+      "default": "./dist/worker/writer.worker.js"
+    },
+    "./reader.worker": {
+      "types": "./dist/worker/reader.worker.d.ts",
+      "default": "./dist/worker/reader.worker.js"
+    },
+    "./package.json": "./package.json"
+  },
   "scripts": {
     "test": "node test/run.mjs",
     "check": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/build-dist.mjs",
+    "lint": "oxlint --type-aware",
+    "lint:fix": "oxlint --type-aware --fix",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
     "harness": "node harness/server.js",
+    "smoke": "node harness/run-smoke.mjs",
     "build:smoke": "node smoke/build.js",
     "build:bench": "node bench/build.mjs",
     "bench:ingest": "node bench/ingest-bench.mjs",
     "bench:types": "node bench/type-fidelity-bench.mjs",
     "generate:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts",
-    "check:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts --check"
+    "check:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts --check",
+    "prepublishOnly": "pnpm check && pnpm lint && pnpm test && pnpm build"
   },
   "dependencies": {
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
+  },
+  "devDependencies": {
+    "@prisma/internals": "7.9.1",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "esbuild": "0.28.2",
+    "oxfmt": "0.62.0",
+    "oxlint": "1.77.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript": "7.0.2"
   },
   "peerDependencies": {
     "@prisma/internals": ">=5",
@@ -54,14 +95,5 @@
       "optional": true
     }
   },
-  "devDependencies": {
-    "@prisma/internals": "7.9.1",
-    "@types/node": "26.2.0",
-    "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.4",
-    "esbuild": "0.28.2",
-    "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "typescript": "7.0.2"
-  }
+  "packageManager": "pnpm@10.27.0"
 }

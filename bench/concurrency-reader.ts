@@ -214,9 +214,11 @@ onmessage = (
   e: MessageEvent<{ cmd: string; id?: number; name?: string; mode?: string; payloadRows?: number }>
 ) => {
   if (e.data.cmd === 'start')
-    start(e.data.id!, (e.data.mode as 'fence' | 'seqlock') ?? 'fence', e.data.payloadRows ?? 0).catch(
-      (err) => postMessage({ type: 'error', error: String((err as Error)?.stack || err) })
-    );
+    start(
+      e.data.id!,
+      (e.data.mode as 'fence' | 'seqlock') ?? 'fence',
+      e.data.payloadRows ?? 0
+    ).catch((err) => postMessage({ type: 'error', error: String((err as Error)?.stack || err) }));
   else if (e.data.cmd === 'phase') phase = e.data.name!;
   else if (e.data.cmd === 'stop') running = false;
 };

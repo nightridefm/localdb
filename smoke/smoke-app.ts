@@ -23,13 +23,22 @@ const SCHEMA = `
 	CREATE INDEX IF NOT EXISTS idx_upload_plays ON upload(plays);
 `;
 
+// ?mode=multi|baton|single forces a connection tier (the headless CI
+// driver exercises all three on Chromium); default probes normally.
+const mode = new URLSearchParams(location.search).get('mode') as
+  | 'multi'
+  | 'baton'
+  | 'single'
+  | null;
+
 const db = new LocalDb(
   {
-    dbName: 'smoke.db',
+    dbName: `smoke-${mode ?? 'auto'}.db`,
     schemaSql: SCHEMA,
     schemaVersion: 1,
     shapes: [{ table: 'upload', primaryKey: ['id'], url: '/shape/upload' }],
     readers: 2,
+    ...(mode ? { forceConnMode: mode } : {}),
   },
   {
     writer: new Worker('/smoke/dist/writer.worker.js', { type: 'module' }),
@@ -37,6 +46,8 @@ const db = new LocalDb(
   }
 );
 w.__db = db;
+
+void db.ready().then(() => events.push(['mode', db.getConnMode()]));
 
 db.onSyncStatus((s) => events.push(['status', s.state]));
 
@@ -52,6 +63,11 @@ db.subscribe<{ n: number }>({ sql: 'SELECT count(*) AS n FROM upload' }, (r) =>
 // Constant query: dirtied by every commit (no extractable deps) but its
 // result never changes - the hash dedupe must deliver it exactly once.
 db.subscribe<{ one: number }>({ sql: 'SELECT 1 AS one' }, (r) => events.push(['const', r.version]));
+
+// Broken SQL must surface as an error result - never an eternal spinner.
+db.subscribe({ sql: 'SELECT * FROM missing_table' }, (r) =>
+  events.push(['badquery', r.error ? 'error' : 'ok'])
+);
 
 // One-shot (loader-path) query once sync is live.
 const un = db.onSyncStatus((s) => {

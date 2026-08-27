@@ -63,12 +63,13 @@ spinning.
 ## Install
 
 ```
-npm install localdb
+npm install @nightride/localdb
 ```
 
-The package ships TypeScript source and is consumed through a bundler
-(Vite, esbuild, ...). `@sqlite.org/sqlite-wasm` is its only runtime
-dependency. React is an optional peer dependency for the hook;
+The package ships compiled JS + type declarations (`dist/`, plus the
+TypeScript source for source maps) and is consumed through a bundler
+(Vite, esbuild, webpack, ...). `@sqlite.org/sqlite-wasm` is its only
+runtime dependency. React is an optional peer dependency for the hook;
 `@prisma/internals` is an optional peer dependency for the codegen CLI.
 
 ## Quick start
@@ -89,7 +90,7 @@ without such columns work without it.
 ### 2. Create the database
 
 ```ts
-import { LocalDb } from 'localdb';
+import { LocalDb } from '@nightride/localdb';
 import { models, ddlFor, shapeColumns } from './gen/models.ts';
 
 const db = new LocalDb(
@@ -112,9 +113,9 @@ const db = new LocalDb(
     fts: [{ table: 'track', columns: ['title'] }],
   },
   {
-    writer: new Worker(new URL('localdb/writer.worker', import.meta.url), { type: 'module' }),
+    writer: new Worker(new URL('@nightride/localdb/writer.worker', import.meta.url), { type: 'module' }),
     spawnReader: () =>
-      new Worker(new URL('localdb/reader.worker', import.meta.url), { type: 'module' }),
+      new Worker(new URL('@nightride/localdb/reader.worker', import.meta.url), { type: 'module' }),
   }
 );
 ```
@@ -135,17 +136,29 @@ const stop = db.subscribe(
 // batched into one worker message and share one consistent snapshot.
 const rows = await db.query('SELECT count(*) AS n FROM track');
 
-// Sync state for boot UI.
+// Sync state for boot UI. The current state is replayed on subscribe, so
+// a late listener still sees a terminal `unsupported`.
 db.onSyncStatus((s) => console.log(s.state));
+
+// Manual sync control (e.g. a "work offline" toggle). Reads keep serving
+// the local data; resume picks up from the stored cursors.
+db.pauseSync();
+db.resumeSync();
 ```
+
+A failing query (broken SQL, torn topology) delivers a result with
+`error` set instead of never firing; the previous good `rows` are kept,
+and the field clears on the next successful delivery. A terminal
+`unsupported` environment rejects `ready()` and all pending `query()`
+calls, so nothing awaits forever.
 
 React:
 
 ```tsx
-import { useLiveQuery } from 'localdb/react';
+import { useLiveQuery } from '@nightride/localdb/react';
 
 function Tracks({ artistId }: { artistId: string }) {
-  const { rows, isLoading } = useLiveQuery<TrackRow>(db, {
+  const { rows, isLoading, error } = useLiveQuery<TrackRow>(db, {
     sql: 'SELECT * FROM track WHERE artist_id = ? ORDER BY created_at DESC',
     params: [artistId],
   });
@@ -164,6 +177,8 @@ Queries are native SQLite. Conventions worth knowing:
 
 - **Timestamps are ISO-8601 UTC text**, normalized at ingest. Compare with
   `strftime('%Y-%m-%dT%H:%M:%fZ','now')`, never bare `datetime('now')`.
+  With model metadata, normalization is scoped to declared DateTime
+  columns; without it, any timestamp-shaped text cell is normalized.
 - **Booleans are stored as 1/0** (so `WHERE is_active` works) and
   **delivered as real `true`/`false`** when model metadata declares the
   column.
@@ -289,13 +304,20 @@ time.
 pnpm install
 pnpm test           # node test suite (runs under TZ=America/New_York)
 pnpm check          # tsc --noEmit over src, tests, smoke, bench
+pnpm lint           # oxlint --type-aware
+pnpm format         # oxfmt (format:check in CI)
 pnpm check:example-models  # codegen drift check for examples/models.ts
+pnpm build          # publishable dist/ (JS + d.ts, .ts imports rewritten)
 
-pnpm build:smoke && pnpm harness   # then open http://127.0.0.1:8077/smoke/
+pnpm build:smoke && pnpm smoke     # headless-Chrome e2e, all three connection tiers
+pnpm build:smoke && pnpm harness   # manual: open http://127.0.0.1:8077/smoke/
 pnpm build:bench && pnpm harness   # then open /bench/concurrency.html?readers=4&seed=100000
 pnpm bench:ingest   # node-side hydration ingest A/B
 pnpm bench:types    # node-side type-fidelity A/B
 ```
+
+CI runs check, lint, format:check, codegen drift, the node tests, the
+dist build, and the headless browser smoke (multi / baton / single).
 
 Layout:
 

@@ -51,6 +51,7 @@ onmessage = async (ev: MessageEvent<ToReader>) => {
       svc = new ReadService(engine, fence, post, {
         readMode: m.readMode,
         advise: m.advise,
+        maxUpdateHz: m.maxUpdateHz,
       });
       commits = new BroadcastChannel(commitChannel(m.dbName));
       commits.onmessage = (e: MessageEvent<CommitNotice>) => svc!.onCommit(e.data);

@@ -20,6 +20,8 @@ export type ToReaderInit = {
   connMode?: 'multi' | 'baton';
   readMode?: 'fence' | 'seqlock';
   advise?: boolean;
+  /** See LocalDbConfig.maxUpdateHz (drives the scheduler tick interval). */
+  maxUpdateHz?: number;
   /** See LocalDbConfig.models (drives typed result delivery). */
   models?: Record<string, ModelMeta>;
 };
@@ -77,6 +79,12 @@ export type FromReader =
 export type ToWriter =
   | { t: 'init'; config: WriterInit }
   | { t: 'visibility'; hidden: boolean }
+  /**
+   * Manual sync pause/resume (LocalDb.pauseSync/resumeSync). Pause stops
+   * the Electric streams (data + cursors stay put); resume restarts them
+   * from the stored cursors. Per-tab: a standby writer records the flag
+   * and honours it if later promoted to leader.
+   */
   | { t: 'pause' }
   | { t: 'resume' };
 
@@ -92,6 +100,8 @@ export type WriterInit = {
   readMode?: 'fence' | 'seqlock';
   /** See LocalDbConfig.advise. */
   advise?: boolean;
+  /** See LocalDbConfig.maxUpdateHz (writer hosts reads in single mode). */
+  maxUpdateHz?: number;
   /** See LocalDbConfig.fts. */
   fts?: Array<{ table: string; columns: string[] }>;
   /** See LocalDbConfig.pauseSyncWhenHidden. */

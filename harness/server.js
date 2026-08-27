@@ -188,9 +188,10 @@ function handler(req, res) {
   });
 }
 
+const PORT = Number(process.env.PORT || 8077);
 http
   .createServer(handler)
-  .listen(8077, '127.0.0.1', () => console.log('harness server on http://127.0.0.1:8077'));
+  .listen(PORT, '127.0.0.1', () => console.log(`harness server on http://127.0.0.1:${PORT}`));
 
 // ── HTTP/2 (TLS) on 8443, optional ─────────────────────────────────────────
 // Over HTTP/1.1 a browser allows only ~6 connections per origin, so N idle

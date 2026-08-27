@@ -1,0 +1,34 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "singleQuote": true,
+  "jsxSingleQuote": true,
+  "trailingComma": "es5",
+  // oxfmt >= 0.60 formats markdown/html/css/yaml too - keep it scoped to
+  // actual TS/JS source. md/yml churn is not worth the diff noise, and
+  // examples/models.ts is codegen output that check:example-models
+  // compares against a fresh generation, so it must stay unformatted.
+  "ignorePatterns": [
+    "dist/**",
+    "test/.build/**",
+    "smoke/dist/**",
+    "bench/.build/**",
+    "bench/dist/**",
+    "examples/models.ts",
+    "**/*.md",
+    "**/*.yml",
+    "**/*.yaml"
+  ],
+  "sortImports": {
+    "groups": [
+      ["type-import"],
+      ["value-builtin", "value-external"],
+      ["type-internal"],
+      ["value-internal"],
+      ["type-parent", "type-sibling", "type-index"],
+      ["value-parent", "value-sibling", "value-index"],
+      ["unknown"]
+    ],
+    "partitionByComment": true
+  },
+  "sortPackageJson": true
+}
