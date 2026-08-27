@@ -1,0 +1,50 @@
+// Example schema for the tests, benches, and docs. A small music-library
+// domain that covers every column class the sync pipeline treats
+// specially: booleans, JSON, scalar lists, timestamps, and numerics.
+//
+// Regenerate the model module after editing:
+//   node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts
+
+datasource db {
+  provider = "postgresql"
+}
+
+model artist {
+  id          String    @id
+  slug        String
+  name        String
+  bio         String?
+  is_verified Boolean?
+  has_avatar  Boolean?
+  links       Json?
+  created_at  DateTime? @db.Timestamptz(3)
+  updated_at  DateTime? @db.Timestamptz(3)
+}
+
+model track {
+  id           String    @id
+  artist_id    String?
+  title        String
+  duration     Float?
+  lufs         Float?
+  track_number Int?
+  beats        Float[]
+  created_at   DateTime? @db.Timestamptz(3)
+}
+
+model playlist {
+  id           String    @id
+  slug         String?
+  name         String
+  is_active    Boolean?
+  show_on_home Boolean?
+  weight       Float?
+  created_at   DateTime? @db.Timestamptz(3)
+}
+
+model playlist_track {
+  id          String @id
+  playlist_id String
+  track_id    String
+  position    Int?
+}

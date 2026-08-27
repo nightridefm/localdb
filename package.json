@@ -1,0 +1,67 @@
+{
+  "name": "localdb",
+  "version": "0.1.0",
+  "description": "Reactive local-first SQLite for the browser: ElectricSQL shape sync into an OPFS-backed sqlite-wasm database, with worker read pools, live queries, and multi-tab support",
+  "license": "MIT",
+  "packageManager": "pnpm@10.27.0",
+  "type": "module",
+  "keywords": [
+    "sqlite",
+    "wasm",
+    "opfs",
+    "electric-sql",
+    "local-first",
+    "sync",
+    "live-queries",
+    "react"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./react": "./src/client/react.ts",
+    "./writer.worker": "./src/worker/writer.worker.ts",
+    "./reader.worker": "./src/worker/reader.worker.ts"
+  },
+  "bin": {
+    "localdb-generate-models": "scripts/generate-models.mjs"
+  },
+  "files": [
+    "src",
+    "scripts/generate-models.mjs"
+  ],
+  "scripts": {
+    "test": "node test/run.mjs",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "harness": "node harness/server.js",
+    "build:smoke": "node smoke/build.js",
+    "build:bench": "node bench/build.mjs",
+    "bench:ingest": "node bench/ingest-bench.mjs",
+    "bench:types": "node bench/type-fidelity-bench.mjs",
+    "generate:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts",
+    "check:example-models": "node scripts/generate-models.mjs examples/schema.prisma examples/models.ts --lib ../src/index.ts --check"
+  },
+  "dependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1"
+  },
+  "peerDependencies": {
+    "@prisma/internals": ">=5",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "@prisma/internals": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@prisma/internals": "7.9.1",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "esbuild": "0.28.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript": "7.0.2"
+  }
+}

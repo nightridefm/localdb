@@ -1,0 +1,6 @@
+node_modules
+test/.build
+bench/.build
+bench/dist
+smoke/dist
+harness/certs
