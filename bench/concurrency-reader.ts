@@ -13,12 +13,18 @@ import type { CommitNotice } from '../src/types.ts';
 
 import { commitChannel, fenceName } from '../src/protocol.ts';
 import { openEngine, type Engine } from '../src/worker/engine.ts';
-import { withReadFence } from '../src/worker/fence.ts';
+import { withReadFences } from '../src/worker/fence.ts';
 import { ReadService } from '../src/worker/read-service.ts';
 // @ts-expect-error plain-JS bench module
 import { median } from './gen.js';
 
 const DB = 'bench.db';
+// attach=1: `upload` lives in its own file, ATTACHed here as `tenant`.
+// Same rows, same join, same write load - only the file boundary differs.
+const TENANT_DB = 'bench-tenant.db';
+let attached = false;
+/** Fences this reader holds per read window: 1 normally, 2 when attached. */
+let fences: string[] = [fenceName(DB)];
 let engine: Engine | null = null;
 let svc: ReadService | null = null;
 let commits: BroadcastChannel | null = null;
@@ -29,10 +35,12 @@ let lastNotice: { seq: number; total: number } | null = null;
 
 const post = (msg: string) => postMessage({ type: 'progress', msg: `[bench-reader${id}] ` + msg });
 
-const QUERY = `
+/** `upload`, schema-qualified when it lives in the attached file. */
+const uploadRef = () => (attached ? 'tenant.upload' : 'upload');
+const query = () => `
 	SELECT json_group_array(json_object('id',u.id,'title',u.title,'artist',u.artist,'plays',u.plays,'created_at',u.created_at))
 	FROM (
-		SELECT u.* FROM link l JOIN upload u ON u.id = l.upload_id
+		SELECT u.* FROM link l JOIN ${uploadRef()} u ON u.id = l.upload_id
 		WHERE l.playlist_id = ? ORDER BY l.position LIMIT 100
 	) u
 `;
@@ -68,7 +76,7 @@ function sampleDv(): number {
 // attempts or when the reopen itself fails (an unfenced reopen can read
 // a torn header mid-commit). Every single read is validated.
 async function readGuarded<T>(fn: () => T): Promise<T> {
-  if (mode === 'fence') return withReadFence(fenceName(DB), fn);
+  if (mode === 'fence') return withReadFences(fences, fn);
   let poisoned = false;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
@@ -87,7 +95,7 @@ async function readGuarded<T>(fn: () => T): Promise<T> {
       }
     }
   }
-  return withReadFence(fenceName(DB), () => {
+  return withReadFences(fences, () => {
     // Under the fence no commit is in flight, so a connection whose
     // unfenced reopen failed on a torn header can be reopened safely.
     if (poisoned) engine!.reopen();
@@ -95,13 +103,26 @@ async function readGuarded<T>(fn: () => T): Promise<T> {
   });
 }
 
-async function start(readerId: number, readMode: 'fence' | 'seqlock', payloadRows = 0) {
+async function start(
+  readerId: number,
+  readMode: 'fence' | 'seqlock',
+  payloadRows = 0,
+  attach = false
+) {
   id = readerId;
   mode = readMode;
-  engine = await openEngine({ dbName: DB, role: 'reader', connMode: 'multi' });
+  attached = attach;
+  // Sorted, matching ReadService's own acquisition order.
+  fences = attach ? [fenceName(DB), fenceName(TENANT_DB)].sort() : [fenceName(DB)];
+  engine = await openEngine({
+    dbName: DB,
+    role: 'reader',
+    connMode: 'multi',
+    ...(attach ? { attach: [{ alias: 'tenant', dbName: TENANT_DB }] } : {}),
+  });
   // The real reactive pipeline: forward subscription results (metadata
   // only) to main, which correlates commitSeq with notice wall times.
-  svc = new ReadService(engine, fenceName(DB), (m: FromReader) => {
+  svc = new ReadService(engine, fences, (m: FromReader) => {
     if (m.t === 'r-results') {
       postMessage({
         type: 'sub-results',
@@ -109,13 +130,19 @@ async function start(readerId: number, readMode: 'fence' | 'seqlock', payloadRow
           key: b.key,
           version: b.version,
           commitSeq: b.commitSeq,
+          // QueryResult.commitSeq deliberately tracks THIS db's sequence,
+          // so with attach=1 - where the write load commits on the
+          // ATTACHED db - it never moves. Report the last notice seen on
+          // the channel being written to as well, so delivery latency
+          // stays measurable in both layouts.
+          noticeSeq: lastNotice?.seq ?? null,
           bytes: b.bytes.byteLength,
         })),
         wall: Date.now(),
       });
     }
   });
-  await svc.subscribe(`count:${id}`, { sql: 'SELECT count(*) AS n FROM upload' });
+  await svc.subscribe(`count:${id}`, { sql: `SELECT count(*) AS n FROM ${uploadRef()}` });
   await svc.subscribe(`agg:${id}`, {
     sql: 'SELECT playlist_id, count(*) AS c FROM link GROUP BY playlist_id ORDER BY c DESC LIMIT 10',
   });
@@ -129,22 +156,26 @@ async function start(readerId: number, readMode: 'fence' | 'seqlock', payloadRow
   // correctly shipped nothing - which measured the scheduler, not the wire.
   if (payloadRows > 0) {
     await svc.subscribe(`payload:${id}`, {
-      sql: `SELECT id, title, artist, plays, created_at FROM upload ORDER BY rowid DESC LIMIT ${payloadRows}`,
+      sql: `SELECT id, title, artist, plays, created_at FROM ${uploadRef()} ORDER BY rowid DESC LIMIT ${payloadRows}`,
     });
   }
-  commits = new BroadcastChannel(commitChannel(DB));
+  // The write load commits on whichever db owns `upload`, so that is the
+  // channel the freshness/latency instruments hook. When attached, the
+  // notice arrives tagged with the alias so dep matching qualifies it.
+  commits = new BroadcastChannel(commitChannel(attach ? TENANT_DB : DB));
   commits.onmessage = (e: MessageEvent<CommitNotice & { total: number }>) => {
     lastNotice = { seq: e.data.seq, total: e.data.total };
     // Start the data_version stopwatch: the bytes are already flushed
     // and visible when the notice goes out, so any delay before this
     // connection's data_version moves is pure detection lag.
     if (!dvPendingSince) dvPendingSince = performance.now();
-    svc!.onCommit(e.data);
+    svc!.onCommit(e.data, attach ? 'tenant' : undefined);
   };
   postMessage({ type: 'ready' });
 
   running = true;
-  const stmt = () => engine!.db.prepare(QUERY);
+  const sql = query();
+  const stmt = () => engine!.db.prepare(sql);
   let i = 0;
   while (running) {
     const ph = phase;
@@ -157,7 +188,7 @@ async function start(readerId: number, readMode: 'fence' | 'seqlock', payloadRow
     await readGuarded(() => {
       if (i % 10 === 9) {
         // Freshness assertion (excluded from latency samples).
-        const n = Number(engine!.db.selectValue('SELECT count(*) FROM upload'));
+        const n = Number(engine!.db.selectValue(`SELECT count(*) FROM ${uploadRef()}`));
         staleness.checks++;
         if (expected && n < expected.total) {
           staleness.violations++;
@@ -211,13 +242,21 @@ async function start(readerId: number, readMode: 'fence' | 'seqlock', payloadRow
 }
 
 onmessage = (
-  e: MessageEvent<{ cmd: string; id?: number; name?: string; mode?: string; payloadRows?: number }>
+  e: MessageEvent<{
+    cmd: string;
+    id?: number;
+    name?: string;
+    mode?: string;
+    payloadRows?: number;
+    attach?: boolean;
+  }>
 ) => {
   if (e.data.cmd === 'start')
     start(
       e.data.id!,
       (e.data.mode as 'fence' | 'seqlock') ?? 'fence',
-      e.data.payloadRows ?? 0
+      e.data.payloadRows ?? 0,
+      e.data.attach ?? false
     ).catch((err) => postMessage({ type: 'error', error: String((err as Error)?.stack || err) }));
   else if (e.data.cmd === 'phase') phase = e.data.name!;
   else if (e.data.cmd === 'stop') running = false;

@@ -229,6 +229,8 @@ All fields of `LocalDbConfig` (see `src/types.ts` for full doc comments):
 | `schemaVersion`       | required  | Bump to wipe the cache and resync every shape.                 |
 | `shapes`              | required  | Electric shape subscriptions.                                  |
 | `models`              | -         | Model metadata for typed ingest + delivery.                    |
+| `attach`              | -         | Read-only ATTACH of other localdb files, for cross-database joins (see below). |
+| `attachReaders`       | 1         | How many pool members open the attached files.                 |
 | `maxUpdateHz`         | 10        | Ceiling for reactive delivery.                                 |
 | `writeCoalesceMs`     | 50        | Write-side commit coalescing window for live traffic.          |
 | `readers`             | cores - 2, max 4 | Reader pool size.                                       |
@@ -271,6 +273,65 @@ Each tab logs its connection mode, leader/standby role, promotions, and
 sync-state transitions to the console, so "which tab is making the shape
 requests" is answerable without a debugger.
 
+## Cross-database joins (`attach`)
+
+Partitioned data - a shared tenant database plus one database per project
+- can be joined in a single query. Each file keeps its own `LocalDb`, its
+own shapes, its own `schemaVersion` and its own wipe cadence; readers on
+one side attach the other read-only.
+
+```ts
+const project = new LocalDb({
+  dbName: 'project-42.db',
+  schemaSql: PROJECT_DDL,
+  schemaVersion: 3,
+  shapes: [{ table: 'line_item', primaryKey: ['id'], url: '/shape/line_item' }],
+  attach: [{ alias: 'tenant', dbName: 'tenant.db', models: tenantModels }],
+}, workers)
+
+// joins across the file boundary, and re-runs when EITHER db commits
+useLiveQuery(project, {
+  sql: `SELECT li.*, s.name FROM line_item li
+        JOIN tenant.standard_line s ON s.id = li.standard_line_id`,
+})
+```
+
+Invalidation is automatic: query dependencies are captured per schema
+(SQLite's authorizer reports the owning database), and each attached db's
+commit channel is subscribed, so a commit on `tenant.db` alone re-runs the
+queries that read it. Consistency follows too - reads hold the shared
+fence of every database involved, and in `seqlock` mode every attached
+schema's `data_version` is sampled, not just `main`'s.
+
+**Writers never attach.** Sync, the write fence and commit broadcasting
+are untouched; this is a read-side feature.
+
+Three things to know before adopting it:
+
+- **`single` mode cannot do this.** OPFS SAHPool access handles are
+  exclusive per file, so the second database cannot be opened at all.
+  Cross-db queries fail there with that reason (single-db queries on the
+  same `LocalDb` keep working normally); everything else degrades nowhere.
+- **Cross-file joins are not LSN-aligned.** `alignShapes` coordinates
+  shapes within one writer, and there are two writers here. A logical
+  change spanning both files lands as two independent commits, so a joined
+  query briefly observes the intermediate state before converging - a
+  measured ~400 ms window when one stream lags the other by 400 ms. Within
+  a single file nothing changes.
+- **Routing reads the SQL text.** Cross-db queries are recognised by the
+  `alias.` qualifier appearing in the query, which is what confines them to
+  the wide readers. A query that reaches an attached table *without naming
+  the alias* - through a main-db VIEW defined over `tenant.x`, say - is
+  routed as a single-db query and fails with "no such table" on a reader
+  that did not attach. Reference the alias in the query itself, or set
+  `attachReaders` to the pool size so every reader is wide.
+- **Attached files cost handles and fence contention**, which is why only
+  `attachReaders` (default 1) pool members open them. Cross-db queries are
+  routed to those readers; everything else still uses the whole pool. Raise
+  it only if the bench says that reader is the bottleneck - the fence being
+  contended belongs to the *attached* db, so every tab that attaches it
+  competes with its writer.
+
 ## Electric protocol coverage
 
 Verified against Electric 1.5.1 and 1.7.9, including live instances:
@@ -304,6 +365,24 @@ seed unless noted; see `bench/` to reproduce):
 | Delta shipping, 1-row change in a 2,051-row list   | 83 B vs 107 KB full |
 | Staleness violations (fence mode, all runs)        | 0                |
 
+Cross-database `attach` (same 100k rows and the same join, partitioned
+into two files vs one; `bench/concurrency.html?attach=1`, 4 readers, every
+reader attached - the worst case, since `attachReaders` defaults to 1):
+
+| Metric (4 readers, 100k rows)  | `fence`           | `seqlock`         |
+| ------------------------------ | ----------------- | ----------------- |
+| Read p50, one file -> attached | 0.25 -> 0.33 ms (+32%) | 0.20 -> 0.20 ms (+0%) |
+| Aggregate qps under writes     | 13,400 -> 10,752 (-20%) | 10,587 -> 10,167 (-4%) |
+| Writer lock wait p50           | 0.3 -> 0.3 ms     | 0.2 -> 0.2 ms     |
+| Reactive delivery p50          | 3 -> 3 ms         | 4 -> 4 ms         |
+| Staleness violations           | 0                 | 0                 |
+
+The cost is the second shared-fence acquisition per read window, so it
+lands almost entirely on `fence` mode; `seqlock` takes no locks and pays
+only one extra `data_version` sample. A commit on the attached db reaches
+subscribers just as fast as a local one, and the attached db's writer was
+not measurably delayed by readers holding its fence.
+
 Scale checks at 10M rows (~2 GB OPFS) stay correct (0 staleness,
 integrity ok); latency is then dominated by per-query cost and fence hold
 time.
@@ -322,12 +401,14 @@ pnpm build          # publishable dist/ (JS + d.ts, .ts imports rewritten)
 pnpm build:smoke && pnpm smoke     # headless-Chrome e2e, all three connection tiers
 pnpm build:smoke && pnpm harness   # manual: open http://127.0.0.1:8077/smoke/
 pnpm build:bench && pnpm harness   # then open /bench/concurrency.html?readers=4&seed=100000
+                                   # add &attach=1 to partition `upload` into a second, ATTACHed db
 pnpm bench:ingest   # node-side hydration ingest A/B
 pnpm bench:types    # node-side type-fidelity A/B
 ```
 
 CI runs check, lint, format:check, codegen drift, the node tests, the
-dist build, and the headless browser smoke (multi / baton / single).
+dist build, and the headless browser smoke (multi / baton / single, each
+running both the main scenario and the cross-database `attach` one).
 
 Layout:
 
@@ -335,7 +416,8 @@ Layout:
 src/            the library (client, workers, sync, VFS, SQL helpers)
 scripts/        generate-models.mjs - Prisma -> models codegen CLI
 examples/       example schema + generated models (used by tests and benches)
-test/           node tests: ingest coercion, tag lifecycle, registry, similarity
+test/           node tests: ingest coercion, tag lifecycle, registry, similarity,
+                attach (deps/validation), routing (reader lane assignment)
 harness/        static server + mock Electric shape endpoint + CDP poller
 smoke/          scripted browser scenarios against the mock endpoint
 bench/          concurrency and ingest/type-fidelity benchmarks
@@ -356,6 +438,8 @@ Drive it with POSTs to `/shape/upload/{insert,update,seed}` and
 - `seqlock` read mode is experimental (see Read consistency).
 - Cross-shape LSN alignment is opt-in and bounded by `maxSkewMs`; without
   it, brief cross-table skew between shapes is possible.
+- `attach` (cross-database joins) is read-only, unavailable in `single`
+  mode, and deliberately not LSN-aligned across files - see above.
 
 ## License
 

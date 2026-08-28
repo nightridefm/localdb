@@ -25,7 +25,7 @@ import type { AnalyzeEntry, FromReader, ToReaderInit } from '../protocol.ts';
 import type { CommitNotice, QuerySpec } from '../types.ts';
 import type { Engine } from './engine.ts';
 
-import { withReadFence } from './fence.ts';
+import { withReadFences } from './fence.ts';
 import { QueryRegistry } from './registry.ts';
 
 type Post = (m: FromReader, transfer?: Transferable[]) => void;
@@ -56,12 +56,19 @@ export class ReadService {
 
   private mode: ReadMode;
 
+  /**
+   * Every fence this service reads under: its own db's, plus one per
+   * attached db. Sorted so the acquisition order is globally consistent.
+   */
+  private fences: readonly string[];
+
   constructor(
     private engine: Engine,
-    private fence: string,
+    fence: string | readonly string[],
     private post: Post,
     private opts: { readMode?: ReadMode; advise?: boolean; maxUpdateHz?: number } = {}
   ) {
+    this.fences = (typeof fence === 'string' ? [fence] : [...fence]).sort();
     // Baton mode forces fence reads: the OPFS handle only exists inside a
     // fence window, so lock-free seqlock reads are structurally impossible.
     this.mode = engine.baton ? 'fence' : (opts.readMode ?? 'fence');
@@ -73,7 +80,11 @@ export class ReadService {
 
   /** Shared-fence + (baton) handle window around a batch of db reads. */
   private async withReadDb<T>(fn: () => T): Promise<T> {
-    return withReadFence(this.fence, async () => {
+    return withReadFences(this.fences, async () => {
+      // acquire() is all-or-nothing (it rolls back its own partial holds
+      // on failure), so it stays OUTSIDE the try: pairing a failed acquire
+      // with a release would decrement a hold belonging to a concurrent
+      // window and close the handle underneath it.
       await this.engine.acquire();
       try {
         return fn();
@@ -83,9 +94,23 @@ export class ReadService {
     });
   }
 
-  onCommit(notice: CommitNotice): void {
-    this.commitSeq = notice.seq;
-    if (this.registry.markDirty(notice.tables) > 0) this.scheduleTick();
+  /**
+   * A commit landed on some database this service reads. `origin` is the
+   * ATTACH alias the notice arrived for, or undefined for this db's own
+   * commits; the notice carries LOCAL table names, so an attached db's are
+   * qualified here to match the dep keys the authorizer produced.
+   *
+   * commitSeq deliberately tracks THIS db's sequence only. Each writer has
+   * its own counter starting at 0, so folding an attached db's seq in
+   * would make QueryResult.commitSeq jump around non-monotonically. A
+   * tenant-only commit therefore leaves commitSeq where it was, which is
+   * the honest answer - the number means "main's commit sequence".
+   */
+  onCommit(notice: CommitNotice, origin?: string): void {
+    if (origin === undefined) this.commitSeq = notice.seq;
+    const tables =
+      origin === undefined ? notice.tables : notice.tables.map((t) => `${origin}.${t}`);
+    if (this.registry.markDirty(tables) > 0) this.scheduleTick();
   }
 
   /**

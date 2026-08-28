@@ -15,7 +15,7 @@
 //
 // which delivers rows shaped { ...t, artist: { ...artist row } | null }.
 
-import type { ModelMeta } from './types.ts';
+import type { AttachDef, ModelMeta } from './types.ts';
 
 const q = (name: string) => `"${name.replaceAll('"', '""')}"`;
 
@@ -128,4 +128,63 @@ export function validateModels(models: Record<string, ModelMeta>): void {
       }
     }
   }
+}
+
+/** A bare SQL identifier - what an ATTACH alias is allowed to be. */
+const BARE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Validate LocalDbConfig.attach at construction. The alias is interpolated
+ * into `ATTACH ... AS <alias>` in the worker, so it is restricted to a
+ * bare identifier rather than escaped - there is no legitimate reason for
+ * an alias to need quoting, and rejecting is safer than quoting.
+ */
+export function validateAttach(attach: readonly AttachDef[], ownDbName: string): void {
+  const seenAlias = new Set<string>();
+  const seenDb = new Set<string>();
+  for (const a of attach) {
+    if (!BARE_IDENT.test(a.alias)) {
+      throw new Error(
+        `localdb attach: alias '${a.alias}' is not a bare identifier (letters, digits, underscore; not starting with a digit)`
+      );
+    }
+    const lower = a.alias.toLowerCase();
+    if (lower === 'main' || lower === 'temp') {
+      throw new Error(`localdb attach: alias '${a.alias}' is reserved by SQLite`);
+    }
+    if (seenAlias.has(lower)) throw new Error(`localdb attach: duplicate alias '${a.alias}'`);
+    seenAlias.add(lower);
+    if (!a.dbName) throw new Error(`localdb attach: alias '${a.alias}' has no dbName`);
+    if (a.dbName === ownDbName) {
+      throw new Error(
+        `localdb attach: alias '${a.alias}' points at this database's own file ('${ownDbName}')`
+      );
+    }
+    if (seenDb.has(a.dbName)) {
+      throw new Error(`localdb attach: '${a.dbName}' is attached more than once`);
+    }
+    seenDb.add(a.dbName);
+  }
+}
+
+/**
+ * Merge the attached dbs' models into the owning db's map for delivery
+ * hints. Keys are namespaced by alias because model NAMES may collide
+ * across databases while describing different tables; embedHints only
+ * reads the values, so the key shape is free.
+ *
+ * The merged map is what validateModels must accept: embedHints is
+ * name-global, so a column name that is boolean in one db and plain text
+ * in another cannot be delivered correctly and has to fail at boot.
+ */
+export function mergeAttachModels(
+  own: Record<string, ModelMeta> | undefined,
+  attach: readonly AttachDef[]
+): Record<string, ModelMeta> | undefined {
+  if (!attach.some((a) => a.models)) return own;
+  const merged: Record<string, ModelMeta> = { ...own };
+  for (const a of attach) {
+    for (const [name, meta] of Object.entries(a.models ?? {})) merged[`${a.alias}:${name}`] = meta;
+  }
+  return merged;
 }

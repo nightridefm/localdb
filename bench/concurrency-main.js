@@ -9,6 +9,10 @@ const MODE = params.get('mode') || 'fence';
 // run measures WIRE cost (hash + transfer + parse of a real grid payload)
 // and not just the scheduler with toy results.
 const PAYLOAD = Number(params.get('payload') || 0);
+// attach=1 partitions `upload` into its own db file, ATTACHed by every
+// reader. Same rows, same join, same write load - the A/B for what a
+// cross-database query actually costs.
+const ATTACH = params.get('attach') === '1';
 
 const logEl = document.getElementById('log');
 window.__progress = [];
@@ -18,9 +22,17 @@ function log(msg) {
   window.__progress.push(`${new Date().toISOString().slice(11, 19)} ${msg}`);
   logEl.textContent = window.__progress.slice(-30).join('\n');
 }
-log(`concurrency bench: readers=${READERS} seed=${SEED_ROWS} mode=${MODE}`);
+log(
+  `concurrency bench: readers=${READERS} seed=${SEED_ROWS} mode=${MODE}${ATTACH ? ' attach=1' : ''}`
+);
 
-const results = { readers: READERS, seed_rows: SEED_ROWS, mode: MODE, payload_rows: PAYLOAD };
+const results = {
+  readers: READERS,
+  seed_rows: SEED_ROWS,
+  mode: MODE,
+  payload_rows: PAYLOAD,
+  attach: ATTACH,
+};
 const writer = new Worker('./dist/writer.js', { type: 'module' });
 const readers = [];
 for (let i = 0; i < READERS; i++) readers.push(new Worker('./dist/reader.js', { type: 'module' }));
@@ -30,7 +42,7 @@ const noticeWall = new Map();
 const deliveryLatencies = [];
 const payloadLatencies = [];
 const payloadBytes = [];
-const bc = new BroadcastChannel('ldb:commits:bench.db');
+const bc = new BroadcastChannel(ATTACH ? 'ldb:commits:bench-tenant.db' : 'ldb:commits:bench.db');
 bc.onmessage = (e) => noticeWall.set(e.data.seq, e.data.wall);
 
 function waitMsg(w, type) {
@@ -53,7 +65,7 @@ for (const w of [writer, ...readers]) {
     if (e.data.type === 'progress') log(e.data.msg);
     else if (e.data.type === 'sub-results') {
       for (const item of e.data.items) {
-        const wall = noticeWall.get(item.commitSeq);
+        const wall = noticeWall.get(ATTACH ? item.noticeSeq : item.commitSeq);
         const isPayload = String(item.key).startsWith('payload:');
         if (wall) {
           deliveryLatencies.push(e.data.wall - wall);
@@ -70,13 +82,13 @@ for (const w of [writer, ...readers]) {
 }
 
 async function run() {
-  writer.postMessage({ cmd: 'init', seedRows: SEED_ROWS });
+  writer.postMessage({ cmd: 'init', seedRows: SEED_ROWS, attach: ATTACH });
   const seeded = await waitMsg(writer, 'seeded');
   results.seed_ms = seeded.seed_ms;
   log(`seeded in ${seeded.seed_ms}ms`);
 
   for (const [i, r] of readers.entries())
-    r.postMessage({ cmd: 'start', id: i, mode: MODE, payloadRows: PAYLOAD });
+    r.postMessage({ cmd: 'start', id: i, mode: MODE, payloadRows: PAYLOAD, attach: ATTACH });
   await Promise.all(readers.map((r) => waitMsg(r, 'ready')));
 
   for (const r of readers) r.postMessage({ cmd: 'phase', name: 'baseline' });

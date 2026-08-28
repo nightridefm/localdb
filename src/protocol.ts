@@ -24,6 +24,12 @@ export type ToReaderInit = {
   maxUpdateHz?: number;
   /** See LocalDbConfig.models (drives typed result delivery). */
   models?: Record<string, ModelMeta>;
+  /**
+   * Read-only attached databases for THIS reader (see LocalDbConfig.attach).
+   * Only the "wide" pool members receive this - the client routes cross-db
+   * queries to them - so most readers still open exactly one file.
+   */
+  attach?: Array<{ alias: string; dbName: string }>;
 };
 export type ToReader =
   | ToReaderInit
@@ -211,4 +217,28 @@ export function routingTable(sql: string): string | null {
   const m = FROM_JOIN.exec(sql);
   if (!m) return null;
   return m[1]!.replace(/_fts(_[a-z]+)?$/, '');
+}
+
+/**
+ * Does `sql` reference any of `aliases` as a schema qualifier
+ * (`tenant.standard_line`)? Used by the client to route cross-db queries
+ * to a reader that has actually attached the file.
+ *
+ * Unlike routingTable this IS load-bearing: sending a cross-db query to a
+ * reader without the attach yields "no such table". So it is deliberately
+ * over-eager - quoting characters are blanked first, which turns
+ * `"tenant"."upload"` into ` tenant . upload ` and still matches, and a
+ * string literal containing 'tenant.' matches too. A false positive only
+ * costs cache locality (the query runs on a wide reader); a false
+ * negative would be an error, so the trade is one-sided.
+ */
+export function referencesAlias(sql: string, aliases: readonly string[]): boolean {
+  if (!aliases.length) return false;
+  const bare = sql.replace(/["`[\]]/g, ' ');
+  for (const a of aliases) {
+    // Aliases are validated as bare identifiers (see validateAttach), so
+    // they need no regex escaping.
+    if (new RegExp(`\\b${a}\\s*\\.`, 'i').test(bare)) return true;
+  }
+  return false;
 }

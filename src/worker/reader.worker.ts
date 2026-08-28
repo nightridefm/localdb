@@ -9,7 +9,7 @@ import type { CommitNotice } from '../types.ts';
 
 import { commitChannel, fenceName } from '../protocol.ts';
 import { openEngine, warmModule } from './engine.ts';
-import { withReadFence } from './fence.ts';
+import { withReadFences } from './fence.ts';
 import { ReadService } from './read-service.ts';
 
 // The client spawns this worker BEFORE the writer has resolved the
@@ -26,35 +26,54 @@ let svc: ReadService | null = null;
 // handler's local scope is eligible for GC, after which commit notices
 // silently stop arriving (observed in Chrome during the smoke test).
 let commits: BroadcastChannel | null = null;
+/** One per attached db - module-scoped for the same GC reason as `commits`. */
+let attachedCommits: BroadcastChannel[] = [];
 
 onmessage = async (ev: MessageEvent<ToReader>) => {
   const m = ev.data;
   try {
     if (m.t === 'r-init') {
       const connMode = m.connMode ?? 'multi';
-      const fence = fenceName(m.dbName);
+      // Attached dbs (LocalDbConfig.attach) reach only the "wide" pool
+      // members; every other reader still opens exactly one file.
+      const attach = m.attach ?? [];
+      // Fence against every writer whose data a query here can touch, not
+      // just this db's. Sorted to match ReadService's acquisition order.
+      const fences = [m.dbName, ...attach.map((a) => a.dbName)].map(fenceName).sort();
+      const open = () =>
+        openEngine({ dbName: m.dbName, role: 'reader', connMode, models: m.models, attach });
       let engine;
       if (connMode === 'baton') {
-        engine = await withReadFence(fence, async () => {
-          const e = await openEngine({
-            dbName: m.dbName,
-            role: 'reader',
-            connMode,
-            models: m.models,
-          });
+        // Every file's handle is opened by the ATTACH, so the boot has to
+        // hold every fence - a 'read-only' acquire while that db's writer
+        // holds its exclusive readwrite handle throws at the platform layer.
+        engine = await withReadFences(fences, async () => {
+          const e = await open();
           e.release();
           return e;
         });
       } else {
-        engine = await openEngine({ dbName: m.dbName, role: 'reader', connMode, models: m.models });
+        engine = await open();
       }
-      svc = new ReadService(engine, fence, post, {
+      svc = new ReadService(engine, fences, post, {
         readMode: m.readMode,
         advise: m.advise,
         maxUpdateHz: m.maxUpdateHz,
       });
+      // r-init is idempotent: close any channels from a previous init so a
+      // re-init cannot leave two handlers feeding one ReadService.
+      commits?.close();
+      for (const bc of attachedCommits) bc.close();
       commits = new BroadcastChannel(commitChannel(m.dbName));
       commits.onmessage = (e: MessageEvent<CommitNotice>) => svc!.onCommit(e.data);
+      // An attached db commits on its OWN channel; without this a
+      // tenant-only change would leave a joined query stale until some
+      // main-db commit happened to re-run it.
+      attachedCommits = attach.map((a) => {
+        const bc = new BroadcastChannel(commitChannel(a.dbName));
+        bc.onmessage = (e: MessageEvent<CommitNotice>) => svc!.onCommit(e.data, a.alias);
+        return bc;
+      });
       post({ t: 'r-ready' });
     } else if (m.t === 'subscribe') {
       await svc!.subscribe(m.key, m.spec);

@@ -24,41 +24,69 @@ import { makeRowGen, makeLinkGen, median } from './gen.js';
 const post = (msg: string) => postMessage({ type: 'progress', msg: '[bench-writer] ' + msg });
 
 const DB = 'bench.db';
+// attach=1 partitions the SAME data over two files: `upload` moves to its
+// own db (with its own writer, fence and commit channel) and the readers
+// ATTACH it. The join, row counts and write load are otherwise identical,
+// so the A/B isolates the cost of the second file.
+const TENANT_DB = 'bench-tenant.db';
 let engine: Engine | null = null;
+/** Owns `upload`. Same object as `engine` unless attach=1. */
+let uploadEngine: Engine | null = null;
 let commits: BroadcastChannel | null = null;
+/** Channel `upload` commits go out on. Same as `commits` unless attach=1. */
+let uploadCommits: BroadcastChannel | null = null;
+let attached = false;
+let uploadDbName = DB;
 let seq = 0;
 let totalRows = 0;
 let seedRowsTotal = 0;
 
-async function init(seedRows: number) {
+async function init(seedRows: number, attach = false) {
+  attached = attach;
+  uploadDbName = attach ? TENANT_DB : DB;
   const root = await navigator.storage.getDirectory();
-  try {
-    await root.removeEntry(DB);
-  } catch {
-    // fresh already
+  for (const f of [DB, TENANT_DB]) {
+    try {
+      await root.removeEntry(f);
+    } catch {
+      // fresh already
+    }
   }
   engine = await openEngine({ dbName: DB, role: 'writer', connMode: 'multi' });
   commits = new BroadcastChannel(commitChannel(DB));
+  if (attach) {
+    uploadEngine = await openEngine({ dbName: TENANT_DB, role: 'writer', connMode: 'multi' });
+    uploadCommits = new BroadcastChannel(commitChannel(TENANT_DB));
+  } else {
+    uploadEngine = engine;
+    uploadCommits = commits;
+  }
   const db = engine.db;
-  db.exec(`
+  const udb = uploadEngine.db;
+  udb.exec(`
 		CREATE TABLE upload (
 			id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL,
 			duration REAL NOT NULL, plays INTEGER NOT NULL, created_at TEXT NOT NULL
 		);
+	`);
+  db.exec(`
 		CREATE TABLE playlist (id INTEGER PRIMARY KEY, name TEXT NOT NULL, radio_id INTEGER NOT NULL);
 		CREATE TABLE link (playlist_id INTEGER NOT NULL, upload_id TEXT NOT NULL, position INTEGER NOT NULL);
 	`);
   const rowGen = makeRowGen(42);
   const t0 = performance.now();
-  await withWriteFence(fenceName(DB), () => {
-    const stmt = db.prepare('INSERT INTO upload VALUES (?,?,?,?,?,?)');
+  const seedUpload = () => {
+    const stmt = udb.prepare('INSERT INTO upload VALUES (?,?,?,?,?,?)');
     for (let i = 0; i < seedRows; i++) {
-      if (i % 25000 === 0) db.exec('BEGIN');
+      if (i % 25000 === 0) udb.exec('BEGIN');
       const r = rowGen(i);
       stmt.bind([r.id, r.title, r.artist, r.duration, r.plays, r.created_at]).stepReset();
-      if (i % 25000 === 24999 || i === seedRows - 1) db.exec('COMMIT');
+      if (i % 25000 === 24999 || i === seedRows - 1) udb.exec('COMMIT');
     }
     stmt.finalize();
+    uploadEngine!.flush();
+  };
+  const seedRest = () => {
     db.exec('BEGIN');
     const ps = db.prepare('INSERT INTO playlist VALUES (?,?,?)');
     for (let i = 1; i <= 1000; i++) ps.bind([i, 'playlist_' + i, i % 20]).stepReset();
@@ -73,14 +101,28 @@ async function init(seedRows: number) {
     db.exec('COMMIT');
     db.exec('CREATE INDEX idx_link_playlist ON link(playlist_id, upload_id); ANALYZE;');
     engine!.flush();
-  });
+  };
+  if (attach) {
+    await withWriteFence(fenceName(TENANT_DB), seedUpload);
+    await withWriteFence(fenceName(DB), seedRest);
+  } else {
+    // One hold for everything, exactly as before - the non-attached path
+    // must stay byte-for-byte comparable with older runs.
+    await withWriteFence(fenceName(DB), () => {
+      seedUpload();
+      seedRest();
+    });
+  }
   totalRows = seedRows;
   seedRowsTotal = seedRows;
   postMessage({ type: 'seeded', seed_ms: Math.round(performance.now() - t0) });
 }
 
 async function writeLoad(opts: { batchRows: number; intervalMs: number; durationMs: number }) {
-  const e = engine!;
+  // The write load lands on whichever db owns `upload` - with attach=1
+  // that is the ATTACHED file, so this measures a "tenant" writer
+  // contending with readers that hold its fence.
+  const e = uploadEngine!;
   const rowGen = makeRowGen(1337);
   const batchTimes: number[] = [];
   const flushTimes: number[] = [];
@@ -89,7 +131,7 @@ async function writeLoad(opts: { batchRows: number; intervalMs: number; duration
   const tEnd = performance.now() + opts.durationMs;
   while (performance.now() < tEnd) {
     const tReq = performance.now();
-    await withWriteFence(fenceName(DB), () => {
+    await withWriteFence(fenceName(uploadDbName), () => {
       const tGot = performance.now();
       lockWaits.push(tGot - tReq);
       e.db.exec('BEGIN');
@@ -109,7 +151,7 @@ async function writeLoad(opts: { batchRows: number; intervalMs: number; duration
       batchNo++;
     });
     seq++;
-    commits!.postMessage({
+    uploadCommits!.postMessage({
       seq,
       tables: ['upload'],
       rows: opts.batchRows,
@@ -135,8 +177,9 @@ async function writeLoad(opts: { batchRows: number; intervalMs: number; duration
 }
 
 function finalize() {
-  const integrity = engine!.db.selectValue('PRAGMA quick_check');
-  const count = engine!.db.selectValue('SELECT count(*) FROM upload');
+  const integrity = uploadEngine!.db.selectValue('PRAGMA quick_check');
+  const count = uploadEngine!.db.selectValue('SELECT count(*) FROM upload');
+  if (attached) uploadEngine!.close();
   engine!.close();
   postMessage({ type: 'finalized', integrity, count });
 }
@@ -145,13 +188,14 @@ onmessage = (
   e: MessageEvent<{
     cmd: string;
     seedRows?: number;
+    attach?: boolean;
     batchRows?: number;
     intervalMs?: number;
     durationMs?: number;
   }>
 ) => {
   const run = async () => {
-    if (e.data.cmd === 'init') await init(e.data.seedRows!);
+    if (e.data.cmd === 'init') await init(e.data.seedRows!, e.data.attach);
     else if (e.data.cmd === 'write')
       await writeLoad({
         batchRows: e.data.batchRows!,

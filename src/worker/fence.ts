@@ -18,3 +18,20 @@ export function withReadFence<T>(fence: string, fn: () => T | Promise<T>): Promi
 export function withWriteFence<T>(fence: string, fn: () => T | Promise<T>): Promise<T> {
   return navigator.locks.request(fence, { mode: 'exclusive' }, async () => fn());
 }
+
+/**
+ * Shared fence over SEVERAL databases (a reader with attached files must
+ * fence against every writer whose data the query can touch, not just its
+ * own). Names are acquired in sorted order so any future two-fence holder
+ * cannot form a cycle with this one; today only readers take more than
+ * one, and writers take exactly one, so no cycle exists regardless.
+ *
+ * The single-fence case delegates straight to withReadFence - the common
+ * path must not grow a wrapper.
+ */
+export function withReadFences<T>(fences: readonly string[], fn: () => T | Promise<T>): Promise<T> {
+  if (fences.length === 1) return withReadFence(fences[0]!, fn);
+  const nest = (i: number): Promise<T> =>
+    i >= fences.length ? Promise.resolve(fn()) : withReadFence(fences[i]!, () => nest(i + 1));
+  return nest(0);
+}

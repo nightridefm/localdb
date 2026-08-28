@@ -24,6 +24,15 @@ Query parameters:
 - `mode=fence|seqlock` - read consistency mode (default fence)
 - `payload=N` - adds a live N-row subscription per reader, so the run
   measures wire cost (hash, transfer, parse) instead of only the scheduler
+- `attach=1` - partitions the SAME data over two db files: `upload` moves
+  to `bench-tenant.db` with its own writer, fence and commit channel, and
+  every reader ATTACHes it as `tenant`. The rows, the join and the write
+  load are identical, so an `attach=0` / `attach=1` pair isolates what
+  crossing a file boundary actually costs - a second OPFS handle per
+  reader, a second shared fence per read window, and (in seqlock) a second
+  `data_version` sample. The write load lands on the ATTACHED file, so it
+  also measures a "tenant" writer contending with readers holding its
+  fence.
 
 Results land in `window.__bench` (JSON); progress in `window.__progress`.
 `node harness/poll-cdp.js` polls a headless Chrome session over CDP and

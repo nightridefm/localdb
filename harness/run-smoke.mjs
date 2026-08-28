@@ -12,6 +12,11 @@
 //   - pauseSync stops deliveries; resumeSync catches up from the cursor
 //   - the constant query is delivered exactly once (hash dedupe)
 //
+// Then a SECOND page per tier (smoke/attach.html) covers cross-database
+// ATTACH: a project db joined to a tenant db, asserting that a commit on
+// the ATTACHED file refreshes a live query - and that 'single' mode fails
+// those queries closed while leaving single-db queries working.
+//
 // Usage: node harness/run-smoke.mjs [multi baton single]   (default: all)
 // Env:   CHROME_BIN (browser binary), SMOKE_PORT, SMOKE_CDP_PORT
 //
@@ -189,6 +194,97 @@ async function runMode(mode, page) {
   }
 }
 
+/**
+ * Cross-database ATTACH (smoke/attach.html). project.db attaches
+ * tenant.db; the mock server's two shapes are split one per file.
+ */
+async function runAttach(mode, page) {
+  const state = async () => {
+    const raw = await page.evaluate(
+      'JSON.stringify({err: window.__error, events: window.__events || []})'
+    );
+    const v = JSON.parse(raw || '{"err":null,"events":[]}');
+    if (v.err) throw new Error(`page reported __error: ${v.err}`);
+    return v.events;
+  };
+  const eventually = (pred, what, timeoutMs = STEP_TIMEOUT_MS) =>
+    waitFor(async () => pred(await state()), what, timeoutMs);
+  const last = (ev, k) => [...ev].reverse().find((e) => e[0] === k);
+
+  await eventually(
+    (ev) => ev.some((e) => e[0] === 'mode' && e[1] === mode),
+    `connMode '${mode}' to boot`,
+    BOOT_TIMEOUT_MS
+  );
+  await eventually(
+    (ev) => ev.some((e) => e[0] === 'tenant-status' && e[1] === 'live'),
+    'tenant db sync to reach live',
+    BOOT_TIMEOUT_MS
+  );
+  await eventually(
+    (ev) => ev.some((e) => e[0] === 'project-status' && e[1] === 'live'),
+    'project db sync to reach live',
+    BOOT_TIMEOUT_MS
+  );
+
+  // Both tiers, attached or not: the project db's OWN queries and the
+  // tenant db's own readers must be completely unaffected. This is the
+  // regression guard - attaching must not disturb the ordinary path.
+  await eventually((ev) => last(ev, 'tenant-own')?.[2] === 50, 'tenant db serves its own readers');
+  await eventually((ev) => last(ev, 'local') !== undefined, 'project db serves its own queries');
+
+  if (mode === 'single') {
+    // SAHPool access handles are exclusive per file, so there is no way to
+    // open the second db. The requirement is that this fails CLOSED with
+    // the reason, rather than surfacing as "no such table".
+    const crossFailed = (ev, key) => {
+      const e = last(ev, key);
+      return e && typeof e[3] === 'string' && e[3].includes("'single' connection mode");
+    };
+    await eventually((ev) => crossFailed(ev, 'xjoin'), 'cross-db join rejected in single mode');
+    await eventually(
+      (ev) => crossFailed(ev, 'tenant-only'),
+      'attached-only query rejected in single mode'
+    );
+    await eventually(
+      (ev) => ev.some((e) => e[0] === 'oneshot-error' && String(e[1]).includes('single')),
+      'cross-db one-shot rejected in single mode'
+    );
+    return;
+  }
+
+  // Hydration reaches the query THROUGH the attach.
+  await eventually(
+    (ev) => last(ev, 'tenant-only')?.[2] === 50,
+    'attached table hydrated (50 rows)'
+  );
+  await eventually((ev) => last(ev, 'oneshot')?.[1] === 50, 'cross-db one-shot loader query');
+
+  // THE assertion: a commit on the ATTACHED db, on its own commit channel,
+  // must re-run a query that reads only attached tables. Nothing on this
+  // db's own channel can refresh it.
+  await fetch(`http://127.0.0.1:${PORT}/shape/upload/insert`, { method: 'POST' });
+  await eventually(
+    (ev) => last(ev, 'tenant-only')?.[2] === 51,
+    'attached-db commit refreshes a live query'
+  );
+
+  // Cross-FILE transactions: 5 pairs, one upload row + one link row each.
+  for (let i = 0; i < 5; i++) {
+    await fetch(`http://127.0.0.1:${PORT}/shape/pair`, { method: 'POST' });
+  }
+  await eventually((ev) => last(ev, 'xjoin')?.[2] === 5, 'cross-db join sees all 5 paired rows');
+  await eventually((ev) => last(ev, 'local')?.[2] === 5, 'project-only query sees all 5 links');
+
+  // Cross-file joins are not LSN-aligned (alignShapes spans one writer, and
+  // there are two here), so the orphan probe may legitimately observe an
+  // intermediate state. What it must NOT do is stay there.
+  await eventually(
+    (ev) => last(ev, 'orphans')?.[2] === 0,
+    'cross-file join converges (no lasting orphans)'
+  );
+}
+
 const bin = chromeBin();
 let server = null;
 let chrome = null;
@@ -231,37 +327,44 @@ try {
     30_000
   );
 
+  // Each scenario gets a FRESH server: the shape log resets to the 50-row
+  // seed, so every tier (and every scenario) asserts against identical data.
+  const SCENARIOS = [
+    { name: '', path: 'smoke/', run: runMode },
+    { name: 'attach', path: 'smoke/attach.html', run: runAttach },
+  ];
   for (const mode of MODES) {
-    // Fresh server per tier: the shape log resets to the 50-row seed, so
-    // every tier asserts against identical data.
-    server = spawn(process.execPath, [path.join(ROOT, 'harness/server.js')], {
-      env: { ...process.env, PORT: String(PORT) },
-      stdio: 'ignore',
-    });
-    await waitFor(
-      () => httpOk(`http://127.0.0.1:${PORT}/shape/upload?offset=-1`),
-      'harness server',
-      15_000
-    );
-    const page = await openPage(`http://127.0.0.1:${PORT}/smoke/?mode=${mode}`);
-    const t0 = Date.now();
-    try {
-      await runMode(mode, page);
-      console.log(`SMOKE PASS [${mode}] (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
-    } catch (err) {
-      failed = true;
-      console.error(`SMOKE FAIL [${mode}]: ${err.message}`);
+    for (const sc of SCENARIOS) {
+      const label = sc.name ? `${mode}/${sc.name}` : mode;
+      server = spawn(process.execPath, [path.join(ROOT, 'harness/server.js')], {
+        env: { ...process.env, PORT: String(PORT) },
+        stdio: 'ignore',
+      });
+      await waitFor(
+        () => httpOk(`http://127.0.0.1:${PORT}/shape/upload?offset=-1`),
+        'harness server',
+        15_000
+      );
+      const page = await openPage(`http://127.0.0.1:${PORT}/${sc.path}?mode=${mode}`);
+      const t0 = Date.now();
       try {
-        const tail = await page.evaluate('JSON.stringify((window.__events||[]).slice(-15))');
-        console.error(`  events tail: ${tail}`);
-      } catch {
-        // page already dead
+        await sc.run(mode, page);
+        console.log(`SMOKE PASS [${label}] (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+      } catch (err) {
+        failed = true;
+        console.error(`SMOKE FAIL [${label}]: ${err.message}`);
+        try {
+          const tail = await page.evaluate('JSON.stringify((window.__events||[]).slice(-15))');
+          console.error(`  events tail: ${tail}`);
+        } catch {
+          // page already dead
+        }
       }
+      await page.close();
+      server.kill('SIGKILL');
+      server = null;
+      await sleep(200);
     }
-    await page.close();
-    server.kill('SIGKILL');
-    server = null;
-    await sleep(200);
   }
 } finally {
   cleanup();

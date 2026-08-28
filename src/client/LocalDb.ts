@@ -24,10 +24,18 @@ import type {
   ToReader,
   ToWriter,
 } from '../protocol.ts';
-import type { LocalDbConfig, QueryResult, QuerySpec, SyncStatus, Unsubscribe } from '../types.ts';
+import type {
+  AttachDef,
+  LocalDbConfig,
+  ModelMeta,
+  QueryResult,
+  QuerySpec,
+  SyncStatus,
+  Unsubscribe,
+} from '../types.ts';
 
-import { hashString, queryKey, routingTable } from '../protocol.ts';
-import { validateModels } from '../sql.ts';
+import { hashString, queryKey, referencesAlias, routingTable } from '../protocol.ts';
+import { mergeAttachModels, validateAttach, validateModels } from '../sql.ts';
 
 type Listener = (result: QueryResult) => void;
 
@@ -126,14 +134,32 @@ export class LocalDb {
   private parkTimer: ReturnType<typeof setTimeout> | null = null;
   private parked = false;
 
+  // ── Attached databases (LocalDbConfig.attach) ─────────────────────────
+  /** Empty for the overwhelming majority of configs - all of this is off. */
+  private readonly attach: readonly AttachDef[];
+  private readonly attachAliases: readonly string[];
+  /**
+   * Models handed to READERS: this db's, plus each attached db's under
+   * alias-prefixed keys. The writer still gets only its own - it ingests
+   * only its own shapes.
+   */
+  private readonly readerModels: Record<string, ModelMeta> | undefined;
+
   constructor(
     public readonly config: LocalDbConfig,
     private workers: { writer: Worker; spawnReader: () => Worker }
   ) {
+    this.attach = config.attach ?? [];
+    this.attachAliases = this.attach.map((a) => a.alias);
+    validateAttach(this.attach, config.dbName);
+    this.readerModels = mergeAttachModels(config.models, this.attach);
     // Name-global boolean/JSON delivery (engine.embedHints) requires
     // collision-free column naming across models - fail at boot, not with
-    // silently mis-typed rows later.
-    if (config.models) validateModels(config.models);
+    // silently mis-typed rows later. With attachments the merged set is
+    // what the reader builds hints from, so it is the set that must be
+    // collision-free: a column that is boolean in one db and text in
+    // another cannot be delivered correctly by a name-global mapping.
+    if (this.readerModels) validateModels(this.readerModels);
     this.writer = workers.writer;
     this.readyPromise = new Promise<void>((res, rej) => {
       this.readyResolve = res;
@@ -307,15 +333,20 @@ export class LocalDb {
   /** Hand the pool its connection mode and wait for every member. */
   private initReaders(): void {
     this.readersReady = 0;
-    for (const w of this.readers) {
-      w.postMessage({
+    // Only the first `wide` readers attach the other files; the rest open
+    // one file as before. Cross-db queries route to [0, wide).
+    const wide = this.wideCount();
+    const attach = this.attach.map((a) => ({ alias: a.alias, dbName: a.dbName }));
+    for (let i = 0; i < this.readers.length; i++) {
+      this.readers[i]!.postMessage({
         t: 'r-init',
         dbName: this.config.dbName,
         connMode: this.connMode === 'baton' ? 'baton' : 'multi',
         readMode: this.config.readMode,
         advise: this.config.advise,
         maxUpdateHz: this.config.maxUpdateHz,
-        models: this.config.models,
+        models: this.readerModels,
+        ...(i < wide ? { attach } : {}),
       } satisfies ToReader);
     }
   }
@@ -548,29 +579,30 @@ export class LocalDb {
       return;
     }
     if (this.connMode === 'single' || this.readers.length === 0) {
+      // 'single' hosts reads on the writer connection, which has no
+      // attachments and cannot get any (SAHPool handles are exclusive per
+      // file). Fail cross-db reads with that reason rather than letting
+      // SQLite answer "no such table: tenant.x".
+      if (this.attachAliases.length && this.rejectCrossDbInSingleMode(m)) return;
       this.writer.postMessage(m);
       return;
     }
     if (m.t === 'query') {
-      // SPLIT the microtask batch across the pool rather than sending it
-      // to one reader: a worker is single-threaded, so one big batch
-      // serializes what the pool could run concurrently. Each reader still
-      // gets ONE message (= one fence hold, one baton handle window) for
-      // its share, so we keep the batching win AND the parallelism.
-      // Measured: 8 concurrent one-shots 0.41ms round-robin (1 window
-      // each) -> 0.54ms single batch -> 0.30ms split batches.
-      const n = Math.min(this.readers.length, m.queries.length);
-      const start = this.leastLoadedReader();
-      for (let c = 0; c < n; c++) {
-        const share = m.queries.filter((_, qi) => qi % n === c);
-        if (!share.length) continue;
-        const i = (start + c) % this.readers.length;
-        this.readerLoad[i]! += share.length;
-        for (const qq of share) this.queryReader.set(qq.id, i);
-        this.readers[i]!.postMessage({ t: 'query', queries: share } satisfies ToReader);
+      // Cross-db members of the batch can only run on a wide reader; the
+      // rest still spread over the whole pool. Two dispatches, so a loader
+      // mixing both kinds keeps its parallelism.
+      const cross = this.attachAliases.length ? m.queries.filter((q) => this.isCrossDb(q.sql)) : [];
+      if (cross.length) {
+        const plain = m.queries.filter((q) => !this.isCrossDb(q.sql));
+        this.dispatchBatch(cross, this.wideCount());
+        if (plain.length) this.dispatchBatch(plain, this.readers.length);
+      } else {
+        this.dispatchBatch(m.queries, this.readers.length);
       }
     } else if (m.t === 'analyze') {
-      this.readers[this.rr++ % this.readers.length]!.postMessage(m);
+      // The recorded corpus may contain cross-db SQL, which only a wide
+      // reader can prepare - and reader 0 is always wide.
+      this.readers[this.attachAliases.length ? 0 : this.rr++ % this.readers.length]!.postMessage(m);
     } else if (m.t === 'subscribe') {
       this.readers[this.readerFor(m.key, m.spec.sql)]!.postMessage(m);
     } else if (m.t === 'unsubscribe') {
@@ -581,23 +613,91 @@ export class LocalDb {
     }
   }
 
-  /** Sticky reader index for a subscription, by table affinity. */
+  /**
+   * Sticky reader index for a subscription, by table affinity. A cross-db
+   * query is confined to the wide lane - correctness, not locality: a
+   * reader without the attach cannot prepare it at all.
+   */
   private readerFor(key: QueryKey, sql: string): number {
     let idx = this.subReader.get(key);
     if (idx === undefined) {
+      const lane = this.isCrossDb(sql) ? this.wideCount() : this.readers.length;
       const table = routingTable(sql);
-      idx = (table ? hashString(table) : hashString(key)) % this.readers.length;
+      idx = (table ? hashString(table) : hashString(key)) % lane;
       this.subReader.set(key, idx);
     }
     return idx;
   }
 
-  private leastLoadedReader(): number {
+  private leastLoadedReader(limit = this.readerLoad.length): number {
     let best = 0;
-    for (let i = 1; i < this.readerLoad.length; i++) {
+    for (let i = 1; i < limit; i++) {
       if (this.readerLoad[i]! < this.readerLoad[best]!) best = i;
     }
     return best;
+  }
+
+  /**
+   * Fan one microtask batch across readers [0, lane). SPLIT rather than
+   * sent to one reader: a worker is single-threaded, so one big batch
+   * serializes what the pool could run concurrently. Each reader still
+   * gets ONE message (= one fence hold, one baton handle window) for its
+   * share, so we keep the batching win AND the parallelism. Measured: 8
+   * concurrent one-shots 0.41ms round-robin (1 window each) -> 0.54ms
+   * single batch -> 0.30ms split batches.
+   */
+  private dispatchBatch(
+    queries: Array<{ id: number; sql: string; params?: QuerySpec['params'] }>,
+    lane: number
+  ): void {
+    const n = Math.min(lane, queries.length);
+    const start = this.leastLoadedReader(lane);
+    for (let c = 0; c < n; c++) {
+      const share = queries.filter((_, qi) => qi % n === c);
+      if (!share.length) continue;
+      const i = (start + c) % lane;
+      this.readerLoad[i]! += share.length;
+      for (const qq of share) this.queryReader.set(qq.id, i);
+      this.readers[i]!.postMessage({ t: 'query', queries: share } satisfies ToReader);
+    }
+  }
+
+  /**
+   * How many pool members opened the attached files. Wide readers are
+   * always the FIRST `k` of the pool, so `% k` lands inside the lane and
+   * reader 0 is wide whenever anything is attached.
+   */
+  private wideCount(): number {
+    if (!this.attach.length || !this.readers.length) return 0;
+    return Math.max(1, Math.min(this.config.attachReaders ?? 1, this.readers.length));
+  }
+
+  /** Does this SQL address an attached db (and so need a wide reader)? */
+  private isCrossDb(sql: string): boolean {
+    return this.attachAliases.length > 0 && referencesAlias(sql, this.attachAliases);
+  }
+
+  /** Returns true when the message was answered with the single-mode error. */
+  private rejectCrossDbInSingleMode(m: ToReader): boolean {
+    const why =
+      `localdb: cross-database queries are unavailable in 'single' connection mode ` +
+      `(attached: ${this.attachAliases.join(', ')}) - OPFS SAHPool access handles are exclusive per file`;
+    if (m.t === 'subscribe' && this.isCrossDb(m.spec.sql)) {
+      this.onReaderMessage({ t: 'r-error', key: m.key, error: why });
+      return true;
+    }
+    if (m.t === 'query') {
+      const bad = m.queries.filter((q) => this.isCrossDb(q.sql));
+      if (!bad.length) return false;
+      this.onReaderMessage({
+        t: 'r-query-results',
+        results: bad.map((q) => ({ id: q.id, error: why })),
+      });
+      const rest = m.queries.filter((q) => !this.isCrossDb(q.sql));
+      if (rest.length) this.writer.postMessage({ t: 'query', queries: rest } satisfies ToReader);
+      return true;
+    }
+    return false;
   }
 
   /** Resolves once sync + read topology are up (first paint can await this). */

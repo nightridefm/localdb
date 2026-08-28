@@ -6,6 +6,7 @@ await bundle([
   { in: 'smoke/smoke-app.ts', out: 'smoke/dist/main.js' },
   { in: 'smoke/patterns-app.ts', out: 'smoke/dist/patterns.js' },
   { in: 'smoke/align-app.ts', out: 'smoke/dist/align.js' },
+  { in: 'smoke/attach-app.ts', out: 'smoke/dist/attach.js' },
   { in: 'smoke/react-smoke.tsx', out: 'smoke/dist/react.js', jsx: true },
   ...WORKER_ENTRIES('smoke/dist'),
 ]);

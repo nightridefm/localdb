@@ -103,6 +103,27 @@ export type ShapeDef = {
   params?: Record<string, string>;
 };
 
+/**
+ * One read-only attached database (see LocalDbConfig.attach).
+ */
+export type AttachDef = {
+  /**
+   * SQL schema alias the file is attached under - queries address it as
+   * `alias.table`. Must be a bare identifier, and not 'main' or 'temp'.
+   */
+  alias: string;
+  /** The attached database's OPFS file name (its own LocalDbConfig.dbName). */
+  dbName: string;
+  /**
+   * Model metadata for the ATTACHED db's tables, so its boolean and JSON
+   * columns are delivered typed rather than as raw 1/0 and JSON text.
+   * Merged into this db's delivery hints under alias-prefixed keys, then
+   * validated together - see validateModels for the naming rule that
+   * merge has to satisfy.
+   */
+  models?: Record<string, ModelMeta>;
+};
+
 export type LocalDbConfig = {
   /** OPFS database file name, e.g. 'app.db'. */
   dbName: string;
@@ -122,6 +143,44 @@ export type LocalDbConfig = {
    * data; it is forwarded to the workers verbatim.
    */
   models?: Record<string, ModelMeta>;
+  /**
+   * Read-only ATTACH of other localdb files, so a query can join across
+   * partitioned databases - e.g. a per-project db joined to a shared
+   * tenant db. Queries then reference `alias.table`.
+   *
+   * READERS ONLY. The writer never opens an attached file, so sync, the
+   * write fence and commit broadcasting are completely unchanged; an
+   * attached db is written by its OWN LocalDb instance (usually in the
+   * same page), and this side only reads it.
+   *
+   * Invalidation follows automatically: the reader subscribes to each
+   * attached db's commit channel and re-runs any query whose dependency
+   * set includes one of its tables.
+   *
+   * Two constraints worth knowing before you reach for it:
+   *   - 'single' connection mode CANNOT attach - SAHPool access handles
+   *     are exclusive per file, so the second file cannot be opened at
+   *     all. Boot fails loudly there rather than silently degrading.
+   *   - Cross-FILE joins are NOT LSN-aligned. `alignShapes` coordinates
+   *     shapes within one writer; nothing coordinates two writers. A
+   *     logical change spanning both files lands as two independent
+   *     commits, so a joined query briefly observes the intermediate
+   *     state before converging. Same-file joins are unaffected.
+   */
+  attach?: AttachDef[];
+  /**
+   * How many reader-pool members open the attached files ("wide" readers).
+   * Default 1. Cross-db queries are routed to these; everything else uses
+   * the whole pool as before.
+   *
+   * The default is 1 because each attach costs every wide reader a second
+   * persistent OPFS access handle (multi mode) and a second shared fence
+   * hold per read window - and that fence is the ATTACHED db's, so N
+   * project tabs contend on one tenant writer. Raise it only if cross-db
+   * queries are a large share of read traffic and the bench says the
+   * single wide reader is the bottleneck. Clamped to [1, pool size].
+   */
+  attachReaders?: number;
   /** Global ceiling for reactive re-run delivery. Default 10 (Hz). */
   maxUpdateHz?: number;
   /**

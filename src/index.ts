@@ -1,5 +1,5 @@
 export { LocalDb } from './client/LocalDb.ts';
-export { bindModels, jsonBool, ftsName, validateModels } from './sql.ts';
+export { bindModels, jsonBool, ftsName, validateModels, validateAttach } from './sql.ts';
 export { queryKey, hashString } from './protocol.ts';
 export {
   trigramSimilarity,
@@ -9,6 +9,7 @@ export {
 } from './similarity.ts';
 export type { AnalyzeEntry } from './protocol.ts';
 export type {
+  AttachDef,
   LocalDbConfig,
   ModelMeta,
   QuerySpec,

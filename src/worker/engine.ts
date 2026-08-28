@@ -136,6 +136,20 @@ export function isUnindexedScan(detail: string): boolean {
   );
 }
 
+/**
+ * Quote a possibly schema-qualified table name for interpolation:
+ * `upload` -> `"upload"`, `tenant.upload` -> `"tenant"."upload"`. Quoting
+ * the whole thing as one identifier would address a table literally named
+ * `tenant.upload`, which never exists - approxRows then threw, and its
+ * catch reported cap+1, making every cross-db subscription look huge to
+ * the index advisor. Exported for tests.
+ */
+export function quoteQualified(name: string): string {
+  const q = (n: string) => `"${n.replaceAll('"', '""')}"`;
+  const i = name.indexOf('.');
+  return i < 0 ? q(name) : `${q(name.slice(0, i))}.${q(name.slice(i + 1))}`;
+}
+
 async function ensureModule(): Promise<Sqlite3Module> {
   if (!sqlite3) {
     const { default: init } = await import('@sqlite.org/sqlite-wasm');
@@ -255,89 +269,55 @@ export async function resolveConnMode(): Promise<ConnMode> {
   return 'single';
 }
 
-export async function openEngine(opts: {
-  dbName: string;
-  /** 'writer' opens read-write and may create; 'reader' opens read-only. */
-  role: 'writer' | 'reader';
-  /** From resolveConnMode(). Readers exist only in 'multi'. */
-  connMode: ConnMode;
-  /** See LocalDbConfig.models - drives typed JSON/boolean delivery. */
-  models?: Record<string, ModelMeta>;
-}): Promise<Engine> {
-  const s3 = await ensureModule();
-  const hints = embedHints(opts.models);
-  const path = `/${opts.dbName}`;
-  let db: Sqlite3Db;
-
-  const PRAGMAS =
-    opts.role === 'writer'
-      ? `PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536;`
-      : `PRAGMA journal_mode=MEMORY; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; PRAGMA query_only=1;`;
-
-  if (opts.connMode === 'multi') {
-    // Both roles hold readwrite-unsafe handles: the platform refuses to
-    // mix read-only with a live writer (lock modes must match). Readers
-    // enforce read-only-ness at the SQLite layer (open 'r' + query_only)
-    // and the VFS never sees a write from them.
-    await preopenFile(path, {
-      mode: 'readwrite-unsafe',
-      create: opts.role === 'writer',
-    });
-    installOpfsModesVfs(s3);
-    db = new s3.oo1.DB(path, opts.role === 'writer' ? 'c' : 'r', OPFS_MODES_VFS);
-  } else if (opts.connMode === 'baton') {
-    // Readers hold 'read-only' handles (N concurrent allowed); the writer
-    // opens the single exclusive 'readwrite' handle only inside its write
-    // fence. Handles are acquired/released around fence windows - the
-    // CALLER of openEngine must hold the matching fence, since the DB
-    // open below reads the header through the handle.
-    await preopenFile(path, {
-      mode: opts.role === 'writer' ? 'readwrite' : 'read-only',
-      create: opts.role === 'writer',
-      baton: true,
-    });
-    installOpfsModesVfs(s3);
-    db = new s3.oo1.DB(path, opts.role === 'writer' ? 'c' : 'r', OPFS_MODES_VFS);
-  } else {
-    if (opts.role === 'reader') {
-      // SAHPool handles are exclusive - a second worker cannot open the
-      // file at all. The client never spawns readers in single mode.
-      throw new Error('single-connection mode has no separate reader connections');
-    }
-    const poolUtil = await s3.installOpfsSAHPoolVfs({
-      name: `ldb-${opts.dbName}`,
-      initialCapacity: 6,
-    });
-    db = new poolUtil.OpfsSAHPoolDb(path);
-  }
-
-  db.exec(PRAGMAS);
-  // The trigram UDFs (similarity, word_similarity, search_similarity) must
-  // exist on EVERY connection, reader and writer alike, so any query can
-  // use pg_trgm-style fuzzy predicates.
-  registerSimilarityUdf(db);
-
-  const capi = s3.capi;
-  const wasm = s3.wasm;
+/**
+ * Query -> "tables this reads" extractor over one connection.
+ *
+ * Built from a db GETTER rather than closed over inside openEngine so the
+ * dependency logic - which is what decides whether a commit re-runs a
+ * query, i.e. whether a live query refreshes at all - can be exercised
+ * against a plain in-memory connection in the node tests. reopen() swaps
+ * the connection underneath, hence the getter.
+ */
+export function createDepsExtractor(
+  getDb: () => Sqlite3Db,
+  capi: Sqlite3Module,
+  wasm: Sqlite3Module
+): { tablesRead: (sql: string) => Set<string>; clear: () => void } {
+  // Cached per SQL text.
+  const depsCache = new Map<string, Set<string>>();
 
   // Dependency extraction: install an authorizer, prepare the statement
   // (which triggers SQLITE_READ callbacks for every table/column the query
-  // touches), then remove it. Cached per SQL text.
-  const depsCache = new Map<string, Set<string>>();
+  // touches), then remove it.
   function tablesRead(sql: string): Set<string> {
+    const db = getDb();
     const cached = depsCache.get(sql);
     if (cached) return cached;
     const tables = new Set<string>();
     let pAuth = 0;
+    let failed = false;
     try {
       // All-args-as-pointers signature: the C authorizer is
       // int xAuth(void*, int, const char*, const char*, const char*, const char*)
       // and installFunction passes char* through as raw wasm pointers -
       // decode explicitly (a plain 's' letter yields pointer numbers).
-      pAuth = wasm.installFunction('i(pipppp)', (_pArg: number, op: number, zTab: number) => {
-        if (op === capi.SQLITE_READ && zTab) tables.add(wasm.cstrToJs(zTab));
-        return capi.SQLITE_OK;
-      });
+      pAuth = wasm.installFunction(
+        'i(pipppp)',
+        (_pArg: number, op: number, zTab: number, _zCol: number, zDb: number) => {
+          if (op === capi.SQLITE_READ && zTab) {
+            // arg5 is the owning schema: 'main', 'temp', or an ATTACH
+            // alias. Qualifying non-main tables is what lets a commit on
+            // an attached db invalidate the right queries - without it
+            // `tenant.standard_line` is indistinguishable from a main-db
+            // table of the same name. 'main' stays bare so every existing
+            // dep key, commit notice and byTable entry is unchanged.
+            const t = wasm.cstrToJs(zTab);
+            const d = zDb ? wasm.cstrToJs(zDb) : '';
+            tables.add(d && d !== 'main' ? `${d}.${t}` : t);
+          }
+          return capi.SQLITE_OK;
+        }
+      );
       capi.sqlite3_set_authorizer(db.pointer, pAuth, 0);
       const stmt = db.prepare(sql);
       stmt.finalize();
@@ -345,6 +325,7 @@ export async function openEngine(opts: {
       // Fallback: unknown deps - callers must treat as "depends on
       // everything" so correctness never hinges on the authorizer.
       tables.clear();
+      failed = true;
     } finally {
       try {
         capi.sqlite3_set_authorizer(db.pointer, 0, 0);
@@ -355,15 +336,164 @@ export async function openEngine(opts: {
     }
     // FTS mirrors: a query on `<t>_fts` (or its shadow tables) must be
     // invalidated by commits to `<t>` - map the dep back to the base table.
+    // Schema-qualified deps survive this unchanged: the greedy `(.+)`
+    // spans the dot, so `tenant.track_fts_data` maps to `tenant.track`.
     const ftsBases: string[] = [];
     for (const t of tables) {
       const m = /^(.+)_fts(_[a-z]+)?$/.exec(t);
       if (m) ftsBases.push(m[1]!);
     }
     for (const b of ftsBases) tables.add(b);
-    depsCache.set(sql, tables);
+    // Do NOT cache the failure fallback. A failed prepare used to poison
+    // this query's deps for the life of the connection, leaving it in the
+    // registry's unknownDeps set (re-run on EVERY commit) even after the
+    // cause cleared. Attaching makes that failure legitimate and transient:
+    // an attached db whose writer has not applied its DDL yet cannot
+    // resolve `alias.table`, and moments later it can.
+    if (!failed) depsCache.set(sql, tables);
     return tables;
   }
+
+  return { tablesRead, clear: () => depsCache.clear() };
+}
+
+export async function openEngine(opts: {
+  dbName: string;
+  /** 'writer' opens read-write and may create; 'reader' opens read-only. */
+  role: 'writer' | 'reader';
+  /** From resolveConnMode(). Readers exist only in 'multi'. */
+  connMode: ConnMode;
+  /** See LocalDbConfig.models - drives typed JSON/boolean delivery. */
+  models?: Record<string, ModelMeta>;
+  /**
+   * Read-only ATTACHed databases (see LocalDbConfig.attach). Readers only:
+   * the writer never opens another db's file, so nothing on the write path
+   * changes. The CALLER must already hold the shared fence of every
+   * attached db (as it does its own) - the ATTACH below reads their
+   * headers, and in baton mode acquires their access handles.
+   */
+  attach?: readonly { alias: string; dbName: string }[];
+}): Promise<Engine> {
+  const s3 = await ensureModule();
+  const hints = embedHints(opts.models);
+  const path = `/${opts.dbName}`;
+  const attach = opts.attach ?? [];
+  const attachPaths = attach.map((a) => `/${a.dbName}`);
+  /** Main file first, then attached - the order acquire/release use. */
+  const allPaths = [path, ...attachPaths];
+  let db: Sqlite3Db;
+  /**
+   * Files THIS call pre-opened, so a failure part-way through the open can
+   * hand every handle back. Without it a throw between the first
+   * preopenFile and setupConnection strands an access handle in the
+   * worker's map with no engine to release it - which in baton mode blocks
+   * the owning database's writer permanently. Attaching makes that
+   * reachable: the extra preopen and the ATTACH statement both touch a
+   * file another LocalDb owns.
+   */
+  const preopenedHere: string[] = [];
+
+  /**
+   * Everything a fresh connection needs beyond being open: pragmas, the
+   * similarity UDFs, and the ATTACHes. reopen() calls this too - an
+   * attached schema does NOT survive closing the connection, and losing it
+   * silently turns every cross-db query into "no such table".
+   */
+  function setupConnection(conn: Sqlite3Db): void {
+    conn.exec(PRAGMAS);
+    // The trigram UDFs (similarity, word_similarity, search_similarity) must
+    // exist on EVERY connection, reader and writer alike, so any query can
+    // use pg_trgm-style fuzzy predicates.
+    registerSimilarityUdf(conn);
+    for (let i = 0; i < attach.length; i++) {
+      // The alias is validated as a bare identifier on the client
+      // (validateAttach), so it is safe to interpolate; the path is
+      // single-quote escaped as a string literal.
+      conn.exec(`ATTACH '${attachPaths[i]!.replaceAll("'", "''")}' AS ${attach[i]!.alias}`);
+    }
+  }
+
+  const PRAGMAS =
+    opts.role === 'writer'
+      ? `PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-65536;`
+      : `PRAGMA journal_mode=MEMORY; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; PRAGMA query_only=1;`;
+
+  try {
+    if (opts.connMode === 'multi') {
+      // Both roles hold readwrite-unsafe handles: the platform refuses to
+      // mix read-only with a live writer (lock modes must match). Readers
+      // enforce read-only-ness at the SQLite layer (open 'r' + query_only)
+      // and the VFS never sees a write from them.
+      if (await preopenFile(path, { mode: 'readwrite-unsafe', create: opts.role === 'writer' })) {
+        preopenedHere.push(path);
+      }
+      // create:true deliberately: the attached db has its own LocalDb and
+      // may not have booted yet. A zero-length OPFS file is a valid EMPTY
+      // SQLite database, so attaching it succeeds and the schema appears as
+      // soon as its writer applies DDL (SQLite re-prepares on the schema
+      // cookie bump). The alternative - failing the attach - would couple
+      // this db's boot to the other's.
+      for (const ap of attachPaths) {
+        if (await preopenFile(ap, { mode: 'readwrite-unsafe', create: true })) {
+          preopenedHere.push(ap);
+        }
+      }
+      installOpfsModesVfs(s3);
+      db = new s3.oo1.DB(path, opts.role === 'writer' ? 'c' : 'r', OPFS_MODES_VFS);
+    } else if (opts.connMode === 'baton') {
+      // Readers hold 'read-only' handles (N concurrent allowed); the writer
+      // opens the single exclusive 'readwrite' handle only inside its write
+      // fence. Handles are acquired/released around fence windows - the
+      // CALLER of openEngine must hold the matching fence, since the DB
+      // open below reads the header through the handle.
+      if (
+        await preopenFile(path, {
+          mode: opts.role === 'writer' ? 'readwrite' : 'read-only',
+          create: opts.role === 'writer',
+          baton: true,
+        })
+      ) {
+        preopenedHere.push(path);
+      }
+      for (const ap of attachPaths) {
+        if (await preopenFile(ap, { mode: 'read-only', create: true, baton: true })) {
+          preopenedHere.push(ap);
+        }
+      }
+      installOpfsModesVfs(s3);
+      db = new s3.oo1.DB(path, opts.role === 'writer' ? 'c' : 'r', OPFS_MODES_VFS);
+    } else {
+      if (opts.role === 'reader') {
+        // SAHPool handles are exclusive - a second worker cannot open the
+        // file at all. The client never spawns readers in single mode.
+        throw new Error('single-connection mode has no separate reader connections');
+      }
+      if (attach.length) {
+        // Not a degradation we can paper over: each SAHPool is scoped to one
+        // dbName and its handles are exclusive, so the attached file is held
+        // by its own LocalDb and cannot be opened here at all.
+        throw new Error(
+          `single-connection mode cannot ATTACH (${attach.map((a) => a.dbName).join(', ')}) - SAHPool access handles are exclusive per file`
+        );
+      }
+      const poolUtil = await s3.installOpfsSAHPoolVfs({
+        name: `ldb-${opts.dbName}`,
+        initialCapacity: 6,
+      });
+      db = new poolUtil.OpfsSAHPoolDb(path);
+    }
+
+    setupConnection(db);
+  } catch (err) {
+    for (const p of preopenedHere) closePreopened(p);
+    throw err;
+  }
+
+  const capi = s3.capi;
+  const wasm = s3.wasm;
+
+  const deps = createDepsExtractor(() => db, capi, wasm);
+  const tablesRead = deps.tablesRead;
 
   // The JSON read path: wrap any SELECT so the full result crosses the
   // WASM boundary as ONE string. The wrapped SQL (which needs the result
@@ -562,24 +692,44 @@ export async function openEngine(opts: {
 
   // Seqlock primitive: cheap prepared read of the connection's view of the
   // file change counter. Bumps only when another connection committed.
-  let dvStmt: Sqlite3Stmt | null = null;
+  //
+  // Every ATTACHed schema keeps its OWN counter: a commit to the tenant
+  // file bumps `tenant.data_version` and leaves main's untouched. Sampling
+  // only main would leave every cross-db read unvalidated - torn joins
+  // with no retry - so all schemas are summed. data_version is
+  // monotonically increasing, so the sum changes iff some schema's did.
+  // The table-valued `pragma_data_version()` form takes no schema
+  // argument, hence the plain PRAGMA statements for the attached ones.
+  type DvSlot = { sql: string; stmt: Sqlite3Stmt | null };
+  let dvSlots: DvSlot[] | null = null;
   function dataVersion(): number {
-    if (!dvStmt) dvStmt = db.prepare('SELECT data_version FROM pragma_data_version()');
-    try {
-      dvStmt.step();
-      return Number(dvStmt.get(0));
-    } finally {
+    if (!dvSlots) {
+      dvSlots = [
+        { sql: 'SELECT data_version FROM pragma_data_version()', stmt: null },
+        ...attach.map((a) => ({ sql: `PRAGMA ${a.alias}.data_version`, stmt: null })),
+      ];
+    }
+    let total = 0;
+    for (const slot of dvSlots) {
+      if (!slot.stmt) slot.stmt = db.prepare(slot.sql);
+      const st = slot.stmt;
       try {
-        dvStmt.reset();
-      } catch {
+        st.step();
+        total += Number(st.get(0));
+      } finally {
         try {
-          dvStmt.finalize();
+          st.reset();
         } catch {
-          // already gone
+          try {
+            st.finalize();
+          } catch {
+            // already gone
+          }
+          slot.stmt = null;
         }
-        dvStmt = null;
       }
     }
+    return total;
   }
 
   // Index advisor: EXPLAIN QUERY PLAN detail lines that start with 'SCAN'
@@ -611,7 +761,7 @@ export async function openEngine(opts: {
     try {
       return Number(
         db.selectValue(
-          `SELECT count(*) FROM (SELECT 1 FROM "${table.replaceAll('"', '""')}" LIMIT ${cap + 1})`
+          `SELECT count(*) FROM (SELECT 1 FROM ${quoteQualified(table)} LIMIT ${cap + 1})`
         )
       );
     } catch {
@@ -636,15 +786,18 @@ export async function openEngine(opts: {
 
   function reopen(): void {
     clearStmtCache();
-    if (dvStmt) {
-      try {
-        dvStmt.finalize();
-      } catch {
-        // already gone
+    if (dvSlots) {
+      for (const slot of dvSlots) {
+        if (!slot.stmt) continue;
+        try {
+          slot.stmt.finalize();
+        } catch {
+          // already gone
+        }
+        slot.stmt = null;
       }
-      dvStmt = null;
     }
-    depsCache.clear();
+    deps.clear();
     wrappedCache.clear();
     try {
       db.close();
@@ -658,8 +811,7 @@ export async function openEngine(opts: {
     } else {
       throw new Error('reopen unsupported in single-connection mode (shared connection)');
     }
-    db.exec(PRAGMAS);
-    registerSimilarityUdf(db);
+    setupConnection(db);
   }
 
   function dropUserTables(): void {
@@ -667,7 +819,7 @@ export async function openEngine(opts: {
       `SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE '\\_ldb\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'`
     );
     for (const n of names) db.exec(`DROP TABLE IF EXISTS "${String(n).replaceAll('"', '""')}"`);
-    depsCache.clear();
+    deps.clear();
     wrappedCache.clear();
     clearStmtCache();
   }
@@ -679,8 +831,42 @@ export async function openEngine(opts: {
     connMode: opts.connMode,
     flush: opts.connMode !== 'single' ? () => flushPreopened(path) : () => {},
     baton: opts.connMode === 'baton',
-    acquire: opts.connMode === 'baton' ? () => acquirePreopened(path) : async () => {},
-    release: opts.connMode === 'baton' ? () => releasePreopened(path) : () => {},
+    // With attachments every file's handle is acquired and released in the
+    // same window - main first, attached after, and released in the same
+    // order. The no-attach path stays a single call, not a loop.
+    acquire:
+      opts.connMode !== 'baton'
+        ? async () => {}
+        : allPaths.length === 1
+          ? () => acquirePreopened(path)
+          : async () => {
+              // ATOMIC. If the second handle cannot be opened, the first
+              // must not stay open: a handle held outside a fence window
+              // blocks that database's OWN writer for good (it fails with
+              // NoModificationAllowedError on every write window from
+              // then on), turning one transient conflict into a
+              // permanently wedged sync.
+              const held: string[] = [];
+              try {
+                for (const p of allPaths) {
+                  await acquirePreopened(p);
+                  held.push(p);
+                }
+              } catch (err) {
+                // Roll back only what THIS call took: releasing a path it
+                // never acquired would decrement another window's hold.
+                for (const p of held) releasePreopened(p);
+                throw err;
+              }
+            },
+    release:
+      opts.connMode !== 'baton'
+        ? () => {}
+        : allPaths.length === 1
+          ? () => releasePreopened(path)
+          : () => {
+              for (const p of allPaths) releasePreopened(p);
+            },
     execJson,
     execJsonBytes,
     execJsonHashed,
@@ -695,7 +881,7 @@ export async function openEngine(opts: {
     close: () => {
       clearStmtCache();
       db.close();
-      if (opts.connMode !== 'single') closePreopened(path);
+      if (opts.connMode !== 'single') for (const p of allPaths) closePreopened(p);
     },
   };
 }

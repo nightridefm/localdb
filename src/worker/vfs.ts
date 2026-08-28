@@ -53,6 +53,25 @@ type PreopenedFile = {
   baton: boolean;
   fileHandle: FileSystemFileHandle;
   mode: HandleMode;
+  /**
+   * Baton mode: how many read windows in THIS worker currently want the
+   * handle. Windows overlap - a subscribe's dep extraction, a scheduler
+   * tick and a one-shot batch can all be in flight at once under the same
+   * shared fence - so the handle is opened by the first and closed by the
+   * last. Without the count the first window to finish closes a handle
+   * the others are still reading through, and their reads fail with
+   * SQLITE_IOERR.
+   */
+  holds: number;
+  /**
+   * In-flight open, so concurrent acquires await the SAME one. Without
+   * it both callers pass the `handle` check before either assigns, both
+   * call createSyncAccessHandle, and the second silently overwrites the
+   * first - leaking a handle that nothing can ever close, which blocks
+   * the owning database's writer permanently (every later write window
+   * fails with NoModificationAllowedError).
+   */
+  opening: Promise<void> | null;
 };
 
 export const OPFS_MODES_VFS = 'opfs-modes';
@@ -70,12 +89,17 @@ async function resolveFileHandle(path: string, create: boolean): Promise<FileSys
   return dir.getFileHandle(segs[segs.length - 1]!, { create });
 }
 
-/** Pre-open an access handle for `path` so the VFS can open it synchronously. */
+/**
+ * Pre-open an access handle for `path` so the VFS can open it
+ * synchronously. Returns true if THIS call opened it, false if it was
+ * already open - the caller needs that to know what it may clean up if a
+ * later step of the same open fails.
+ */
 export async function preopenFile(
   path: string,
   opts: { mode: HandleMode; create?: boolean; baton?: boolean }
-): Promise<void> {
-  if (preopened.has(path)) return;
+): Promise<boolean> {
+  if (preopened.has(path)) return false;
   const fh = await resolveFileHandle(path, opts.create ?? false);
   const handle = await (
     fh as FileSystemFileHandle & {
@@ -88,7 +112,12 @@ export async function preopenFile(
     baton: opts.baton ?? false,
     fileHandle: fh,
     mode: opts.mode,
+    // The pre-open itself is not a window: openEngine's caller releases
+    // once to hand the baton back, which takes the count 0 -> closed.
+    holds: 0,
+    opening: null,
   });
+  return true;
 }
 
 /**
@@ -100,12 +129,37 @@ export async function preopenFile(
  */
 export async function acquirePreopened(path: string): Promise<void> {
   const f = preopened.get(path);
-  if (!f || !f.baton || f.handle) return;
-  f.handle = await (
-    f.fileHandle as FileSystemFileHandle & {
-      createSyncAccessHandle: (o?: { mode?: HandleMode }) => Promise<FileSystemSyncAccessHandle>;
-    }
-  ).createSyncAccessHandle({ mode: f.mode });
+  if (!f || !f.baton) return;
+  f.holds++;
+  if (f.handle) return;
+  if (!f.opening) f.opening = openHandle(path, f);
+  const inFlight = f.opening;
+  try {
+    await inFlight;
+  } catch (err) {
+    f.holds--;
+    throw err;
+  } finally {
+    if (f.opening === inFlight) f.opening = null;
+  }
+}
+
+async function openHandle(path: string, f: PreopenedFile): Promise<void> {
+  try {
+    f.handle = await (
+      f.fileHandle as FileSystemFileHandle & {
+        createSyncAccessHandle: (o?: { mode?: HandleMode }) => Promise<FileSystemSyncAccessHandle>;
+      }
+    ).createSyncAccessHandle({ mode: f.mode });
+  } catch (err) {
+    // The platform error names neither the file nor the mode, which makes
+    // a handle conflict between two databases (an ATTACHed one, say)
+    // undebuggable from a log line. Say which.
+    throw new Error(
+      `localdb: cannot acquire '${f.mode}' access handle for ${path}: ${String((err as Error)?.message ?? err)}`,
+      { cause: err }
+    );
+  }
 }
 
 /**
@@ -115,7 +169,10 @@ export async function acquirePreopened(path: string): Promise<void> {
  */
 export function releasePreopened(path: string): void {
   const f = preopened.get(path);
-  if (!f || !f.baton || !f.handle) return;
+  if (!f || !f.baton) return;
+  if (f.holds > 0) f.holds--;
+  // Only the LAST window hands the baton back.
+  if (f.holds > 0 || !f.handle) return;
   try {
     if (!f.readonly) f.handle.flush();
     f.handle.close();
@@ -133,6 +190,7 @@ export function closePreopened(path?: string): void {
     } catch {
       // already closed
     }
+    f.holds = 0;
     preopened.delete(p);
   }
 }
