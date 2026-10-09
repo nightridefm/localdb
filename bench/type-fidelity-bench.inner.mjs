@@ -4,7 +4,7 @@ import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 
 import { ddlFor, models, rowJson } from '../examples/models.ts';
 import { makeApplier, makeColumnNormalizer, normalizeValue } from '../src/sync/apply.ts';
-import { embedExpr, embedHints } from '../src/worker/engine.ts';
+import { embedHints, wrapJsonSql } from '../src/worker/engine.ts';
 
 const hints = embedHints(models);
 
@@ -103,12 +103,10 @@ function ingest(table) {
 
 // 3 ── read delivery A/B ─────────────────────────────────────────────────
 function wrapPlain(names, inner) {
-  const cols = names.map((n) => `'${n}', "${n}"`).join(', ');
-  return `SELECT COALESCE(json_group_array(json(__row)), '[]') FROM (SELECT json_object(${cols}) AS __row FROM (${inner}))`;
+  return wrapJsonSql(inner, names);
 }
 function wrapTyped(names, inner) {
-  const cols = names.map((n) => embedExpr(n, hints)).join(', ');
-  return `SELECT COALESCE(json_group_array(json(__row)), '[]') FROM (SELECT json_object(${cols}) AS __row FROM (${inner}))`;
+  return wrapJsonSql(inner, names, hints);
 }
 function colNames(sql) {
   const probe = db.prepare(sql);

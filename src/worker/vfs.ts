@@ -337,19 +337,6 @@ export function installOpfsModesVfs(sqlite3: Sqlite3): void {
   installed = true;
 }
 
-/**
- * Does THE mode the multi tier actually uses work here? Probes by opening
- * two 'readwrite-unsafe' handles on a scratch file - that is exactly what
- * multi mode needs (writer + readers all hold readwrite-unsafe; lock modes
- * on a file must match, so nothing weaker proves the capability).
- * Chromium 121+ passes. Cached per worker.
- *
- * Deliberately NOT probed with 'read-only': Safari supports read-only's
- * shared semantics WITHOUT supporting readwrite-unsafe, so a read-only
- * probe would pass and then multi-mode boot would throw on the first real
- * handle (WebIDL rejects the unknown enum value) - a silent-hang
- * misdetection instead of a clean fall to 'single'.
- */
 /** Is OPFS present at all? False in Safari Private Browsing and pre-OPFS browsers. */
 export async function opfsAvailable(): Promise<boolean> {
   try {
@@ -361,11 +348,6 @@ export async function opfsAvailable(): Promise<boolean> {
   }
 }
 
-/**
- * Baton-tier probe: can two 'read-only' handles coexist on one file?
- * Safari 16.4+ and Firefox support this without readwrite-unsafe - it
- * enables the read-only-readers + fenced-readwrite-writer baton mode.
- */
 /**
  * PRIVATE, per-probe file name. Probes sharing a fixed name race when
  * several tabs boot at once: one worker's removeEntry can delete the file
@@ -396,6 +378,11 @@ async function removeProbe(root: FileSystemDirectoryHandle, name: string): Promi
 }
 
 let readOnlyModeSupported: boolean | null = null;
+/**
+ * Baton-tier probe: can two 'read-only' handles coexist on one file?
+ * Safari 16.4+ and Firefox support this without readwrite-unsafe - it
+ * enables the read-only-readers + fenced-readwrite-writer baton mode.
+ */
 export async function detectReadOnlyMode(): Promise<boolean> {
   if (readOnlyModeSupported !== null) return readOnlyModeSupported;
   const root = await navigator.storage.getDirectory();
@@ -429,6 +416,19 @@ export async function detectReadOnlyMode(): Promise<boolean> {
 }
 
 let handleModesSupported: boolean | null = null;
+/**
+ * Does THE mode the multi tier actually uses work here? Probes by opening
+ * two 'readwrite-unsafe' handles on a scratch file - that is exactly what
+ * multi mode needs (writer + readers all hold readwrite-unsafe; lock modes
+ * on a file must match, so nothing weaker proves the capability).
+ * Chromium 121+ passes. Cached per worker.
+ *
+ * Deliberately NOT probed with 'read-only': Safari supports read-only's
+ * shared semantics WITHOUT supporting readwrite-unsafe, so a read-only
+ * probe would pass and then multi-mode boot would throw on the first real
+ * handle (WebIDL rejects the unknown enum value) - a silent-hang
+ * misdetection instead of a clean fall to 'single'.
+ */
 export async function detectHandleModes(): Promise<boolean> {
   if (handleModesSupported !== null) return handleModesSupported;
   // Per-probe file name + cleanup outside the verdict - see probeName().

@@ -733,7 +733,10 @@ export class LocalDb {
     if (sub.snapshot) (listener as Listener)(sub.snapshot);
     return () => {
       sub.listeners.delete(listener as Listener);
-      if (sub.listeners.size === 0) {
+      // Identity check, not just size: a second call of this function after
+      // the key was re-subscribed would otherwise tear down the NEW
+      // subscription and unsubscribe the worker entry it relies on.
+      if (sub.listeners.size === 0 && this.subs.get(key) === sub) {
         this.subs.delete(key);
         this.pendingDeliveries.delete(sub);
         this.routeReaderMsg({ t: 'unsubscribe', key });
@@ -743,9 +746,17 @@ export class LocalDb {
 
   /** Snapshot for a key if a live subscription already has one (hook fast path). */
   peek<Row = unknown>(spec: QuerySpec): QueryResult<Row> | null {
-    return (
-      (this.subs.get(queryKey(spec.sql, spec.params, spec))?.snapshot as QueryResult<Row>) ?? null
-    );
+    return this.peekKey<Row>(queryKey(spec.sql, spec.params, spec));
+  }
+
+  /**
+   * peek() by an already-computed queryKey. @internal - for useLiveQuery,
+   * whose getSnapshot React calls 3x per component per update: rebuilding
+   * the key there (hash of the SQL + JSON.stringify of the params) was
+   * ~0.67us per call, ~2ms per update with 1000 hooks mounted.
+   */
+  peekKey<Row = unknown>(key: QueryKey): QueryResult<Row> | null {
+    return (this.subs.get(key)?.snapshot as QueryResult<Row>) ?? null;
   }
 
   /**

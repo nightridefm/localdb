@@ -7,7 +7,7 @@
 // space, collect 3-grams into a set; similarity = |A ∩ B| / |A ∪ B|.
 
 export function trigramSimilarity(a: string, b: string): number {
-  return similarityToSet(a, trigramSet(b));
+  return similarityToQuery(a, queryTrigrams(b, adhocQuery()));
 }
 
 /**
@@ -23,7 +23,7 @@ export function trigramSimilarity(a: string, b: string): number {
  * differ slightly; same 0..1 range and intent).
  */
 export function wordSimilarity(query: string, text: string): number {
-  return wordSimilarityToSet(trigramSet(query), countWords(query), text);
+  return wordSimilarityToQuery(queryTrigrams(query, adhocQuery()), text);
 }
 
 /**
@@ -40,34 +40,293 @@ export function wordSimilarity(query: string, text: string): number {
  * differently on purpose.
  */
 export function searchSimilarity(query: string, text: string): number {
-  return searchSimilarityToSets(wordTrigramSets(query), text);
+  return searchSimilarityToWords(queryWordTrigrams(query), text);
 }
 
-function searchSimilarityToSets(qSets: Array<Set<number>>, text: string): number {
-  if (qSets.length === 0) return 0;
-  const words = wordTrigramSets(text);
-  if (words.length === 0) return 0;
-  // Adjacent-pair unions built ONCE per row and shared by every query
-  // word (building them per query word would double allocations).
-  let pairs: Array<Set<number>> | null = null;
-  if (words.length > 1) {
-    pairs = [];
-    for (let i = 0; i + 1 < words.length; i++) {
-      const u = new Set(words[i]!);
-      for (const t of words[i + 1]!) u.add(t);
-      pairs.push(u);
+// Trigrams are encoded as integers (6 bits per symbol: space=0, 0-9,
+// a-z), so a trigram is an index into a 2^18 table. The trigram
+// DEFINITION is pg_trgm's: lowercase words split on non-alphanumerics,
+// each padded '  w ' - non-ASCII acts as a word boundary, matching the
+// string version and the PLS importer's copy.
+//
+// These functions run once per ROW of a scan (50k rows per search
+// keystroke is normal), so the row side allocates nothing: trigrams go
+// into module-level typed arrays, and set semantics (dedupe, union,
+// intersection) come from generation stamps instead of Set objects. The
+// query side is built once per query string and memoized by the UDFs.
+// Nothing here re-enters, so one set of scratch buffers serves every
+// function.
+const TRIGRAMS = 1 << 18;
+const MASK = TRIGRAMS - 1;
+
+/** stamp[t] === gen marks t as a member of the set being built. */
+const stamp = new Uint32Array(TRIGRAMS);
+let gen = 0;
+function nextGen(): number {
+  if (++gen === 0xffffffff) {
+    stamp.fill(0);
+    gen = 1;
+  }
+  return gen;
+}
+
+// Row parse output. rowTri holds each word's trigrams (len + 1 per word,
+// duplicates included) back to back; word w spans
+// [wordEnd[w - 1] (0 for w = 0), wordEnd[w]).
+let rowTri = new Int32Array(256);
+let wordEnd = new Int32Array(64);
+// Per-word DEDUPED trigrams for search (same layout via uniqEnd), and the
+// deduped union of each adjacent word pair (via pairEnd).
+let uniqTri = new Int32Array(256);
+let uniqEnd = new Int32Array(64);
+let pairTri = new Int32Array(512);
+let pairEnd = new Int32Array(64);
+
+function growInt32(a: Int32Array<ArrayBuffer>, need: number): Int32Array<ArrayBuffer> {
+  if (a.length >= need) return a;
+  let n = a.length;
+  while (n < need) n *= 2;
+  return new Int32Array(n);
+}
+
+/** Trigram symbol of a lowercase char code, or -1 for a word boundary. */
+function symbol(ch: number): number {
+  if (ch >= 97 && ch <= 122) return ch - 86;
+  if (ch >= 48 && ch <= 57) return ch - 47;
+  return -1;
+}
+
+/**
+ * Parse `s` into rowTri / wordEnd and return the word count. ASCII is
+ * lowercased inline; any non-ASCII char re-runs the parse over
+ * toLowerCase(), because Unicode lowercasing can produce ASCII letters
+ * (KELVIN SIGN -> 'k', 'İ' -> 'i' + a combining dot) and change the
+ * length.
+ */
+function parseRow(s: string): number {
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    if (s.charCodeAt(i) >= 128) return parseLower(s.toLowerCase(), false);
+  }
+  return parseLower(s, true);
+}
+
+function parseLower(s: string, asciiUpper: boolean): number {
+  const n = s.length;
+  // A word of len chars yields len + 1 trigrams, so n + n/1 bounds it.
+  rowTri = growInt32(rowTri, 2 * n + 2);
+  wordEnd = growInt32(wordEnd, n + 1);
+  let k = 0;
+  let words = 0;
+  let t = 0;
+  let inWord = false;
+  for (let i = 0; i < n; i++) {
+    let ch = s.charCodeAt(i);
+    if (asciiUpper && ch >= 65 && ch <= 90) ch += 32;
+    const sym = symbol(ch);
+    if (sym < 0) {
+      if (inWord) {
+        rowTri[k++] = (t << 6) & MASK;
+        wordEnd[words++] = k;
+        inWord = false;
+      }
+      continue;
+    }
+    if (!inWord) {
+      inWord = true;
+      t = 0;
+    }
+    t = ((t << 6) | sym) & MASK;
+    rowTri[k++] = t;
+  }
+  if (inWord) {
+    rowTri[k++] = (t << 6) & MASK;
+    wordEnd[words++] = k;
+  }
+  return words;
+}
+
+/** Dedupe each parsed word into uniqTri / uniqEnd. */
+function dedupeWords(words: number): void {
+  uniqTri = growInt32(uniqTri, wordEnd[words - 1]!);
+  uniqEnd = growInt32(uniqEnd, words);
+  let k = 0;
+  let from = 0;
+  for (let w = 0; w < words; w++) {
+    const g = nextGen();
+    const to = wordEnd[w]!;
+    for (let i = from; i < to; i++) {
+      const t = rowTri[i]!;
+      if (stamp[t] !== g) {
+        stamp[t] = g;
+        uniqTri[k++] = t;
+      }
+    }
+    uniqEnd[w] = k;
+    from = to;
+  }
+}
+
+/** Union of each adjacent deduped word pair into pairTri / pairEnd. */
+function buildPairs(words: number): void {
+  pairTri = growInt32(pairTri, 2 * uniqEnd[words - 1]!);
+  pairEnd = growInt32(pairEnd, words);
+  let k = 0;
+  for (let w = 0; w + 1 < words; w++) {
+    const g = nextGen();
+    const to = uniqEnd[w + 1]!;
+    for (let i = w === 0 ? 0 : uniqEnd[w - 1]!; i < to; i++) {
+      const t = uniqTri[i]!;
+      if (stamp[t] !== g) {
+        stamp[t] = g;
+        pairTri[k++] = t;
+      }
+    }
+    pairEnd[w] = k;
+  }
+}
+
+/**
+ * A memoized query trigram set: a membership table for O(1) probes, plus
+ * the member list so a query change can clear exactly what it set.
+ */
+class QueryTrigrams {
+  member = new Uint8Array(TRIGRAMS);
+  list = new Int32Array(0);
+  size = 0;
+  words = 0;
+}
+
+/** Shared by the direct (non-UDF) entry points; the UDFs memoize their own. */
+let adhoc: QueryTrigrams | null = null;
+function adhocQuery(): QueryTrigrams {
+  return (adhoc ??= new QueryTrigrams());
+}
+
+function queryTrigrams(s: string, q: QueryTrigrams): QueryTrigrams {
+  for (let i = 0; i < q.size; i++) q.member[q.list[i]!] = 0;
+  const words = parseRow(s);
+  const n = words ? wordEnd[words - 1]! : 0;
+  const list = new Int32Array(n);
+  let size = 0;
+  for (let i = 0; i < n; i++) {
+    const t = rowTri[i]!;
+    if (!q.member[t]) {
+      q.member[t] = 1;
+      list[size++] = t;
     }
   }
+  q.list = list;
+  q.size = size;
+  q.words = words;
+  return q;
+}
+
+/** Per query word: its deduped trigrams, sorted for binary search. */
+function queryWordTrigrams(s: string): Int32Array[] {
+  const words = parseRow(s);
+  if (!words) return [];
+  dedupeWords(words);
+  const out: Int32Array[] = [];
+  let from = 0;
+  for (let w = 0; w < words; w++) {
+    out.push(uniqTri.slice(from, uniqEnd[w]!).sort());
+    from = uniqEnd[w]!;
+  }
+  return out;
+}
+
+function has(sorted: Int32Array, t: number): boolean {
+  let lo = 0;
+  let hi = sorted.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const v = sorted[mid]!;
+    if (v === t) return true;
+    if (v < t) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return false;
+}
+
+/** |qw ∩ buf[from, to)|, where the range is already deduped. */
+function sharedWith(qw: Int32Array, buf: Int32Array, from: number, to: number): number {
+  let shared = 0;
+  for (let i = from; i < to; i++) if (has(qw, buf[i]!)) shared++;
+  return shared;
+}
+
+function similarityToQuery(a: string, q: QueryTrigrams): number {
+  if (q.size === 0) return 0;
+  const words = parseRow(a);
+  if (!words) return 0;
+  const g = nextGen();
+  const n = wordEnd[words - 1]!;
+  let size = 0;
+  let shared = 0;
+  for (let i = 0; i < n; i++) {
+    const t = rowTri[i]!;
+    if (stamp[t] !== g) {
+      stamp[t] = g;
+      size++;
+      if (q.member[t]) shared++;
+    }
+  }
+  return shared / (q.size + size - shared);
+}
+
+function wordSimilarityToQuery(q: QueryTrigrams, text: string): number {
+  if (q.size === 0) return 0;
+  const words = parseRow(text);
+  if (!words) return 0;
+  const maxWin = q.words + 1;
+  let best = 0;
+  for (let i = 0; i < words && best < 1; i++) {
+    // The window [i, j] grows one word at a time; its union is tracked
+    // incrementally under one generation.
+    const g = nextGen();
+    let size = 0;
+    let shared = 0;
+    const end = Math.min(words, i + maxWin);
+    for (let j = i; j < end; j++) {
+      const to = wordEnd[j]!;
+      for (let x = j === 0 ? 0 : wordEnd[j - 1]!; x < to; x++) {
+        const t = rowTri[x]!;
+        if (stamp[t] !== g) {
+          stamp[t] = g;
+          size++;
+          if (q.member[t]) shared++;
+        }
+      }
+      best = Math.max(best, shared / (q.size + size - shared));
+    }
+  }
+  return best;
+}
+
+function searchSimilarityToWords(qWords: Int32Array[], text: string): number {
+  if (qWords.length === 0) return 0;
+  const words = parseRow(text);
+  if (!words) return 0;
+  dedupeWords(words);
+  // Adjacent-pair unions built ONCE per row and shared by every query word.
+  if (words > 1) buildPairs(words);
   let min = 1;
-  for (const qw of qSets) {
+  for (const qw of qWords) {
     let best = 0;
-    for (const w of words) {
-      const s = jaccard(qw, w);
+    for (let w = 0; w < words; w++) {
+      const from = w === 0 ? 0 : uniqEnd[w - 1]!;
+      const to = uniqEnd[w]!;
+      const shared = sharedWith(qw, uniqTri, from, to);
+      const s = shared / (qw.length + (to - from) - shared);
       if (s > best) best = s;
     }
-    if (pairs && best < 1) {
-      for (const p of pairs) {
-        const s = jaccard(qw, p);
+    if (words > 1 && best < 1) {
+      for (let p = 0; p + 1 < words; p++) {
+        const from = p === 0 ? 0 : pairEnd[p - 1]!;
+        const to = pairEnd[p]!;
+        const shared = sharedWith(qw, pairTri, from, to);
+        const s = shared / (qw.length + (to - from) - shared);
         if (s > best) best = s;
       }
     }
@@ -77,98 +336,6 @@ function searchSimilarityToSets(qSets: Array<Set<number>>, text: string): number
     }
   }
   return min;
-}
-
-function wordSimilarityToSet(q: Set<number>, qWords: number, text: string): number {
-  if (q.size === 0) return 0;
-  const words = wordTrigramSets(text);
-  if (words.length === 0) return 0;
-  const maxWin = qWords + 1;
-  let best = 0;
-  for (let i = 0; i < words.length && best < 1; i++) {
-    const acc = new Set(words[i]!);
-    best = Math.max(best, jaccard(q, acc));
-    const end = Math.min(words.length, i + maxWin);
-    for (let j = i + 1; j < end; j++) {
-      for (const t of words[j]!) acc.add(t);
-      best = Math.max(best, jaccard(q, acc));
-    }
-  }
-  return best;
-}
-
-function similarityToSet(a: string, tb: Set<number>): number {
-  return tb.size === 0 ? 0 : jaccard(trigramSet(a), tb);
-}
-
-function jaccard(a: Set<number>, b: Set<number>): number {
-  if (a.size === 0 || b.size === 0) return 0;
-  const small = a.size <= b.size ? a : b;
-  const big = small === a ? b : a;
-  let shared = 0;
-  for (const t of small) if (big.has(t)) shared++;
-  return shared / (a.size + b.size - shared);
-}
-
-// Trigrams are encoded as integers (6 bits per symbol: space=0, 0-9,
-// a-z) instead of 3-char strings - a full-catalogue scan builds one of
-// these per ROW, and Set<number> membership avoids both the per-trigram
-// string allocation and string hashing (measured ~4x on the 50k-row
-// scan bench). The trigram DEFINITION is unchanged from pg_trgm:
-// lowercase words split on non-alphanumerics, each padded '  w ' -
-// non-ASCII acts as a word boundary, matching the string version and
-// the PLS importer's copy.
-function eachWord(s: string, cb: (lower: string, start: number, len: number) => void): void {
-  const lower = s.toLowerCase();
-  const n = lower.length;
-  let i = 0;
-  while (i < n) {
-    const start = i;
-    while (i < n) {
-      const ch = lower.charCodeAt(i);
-      const alnum = (ch >= 97 && ch <= 122) || (ch >= 48 && ch <= 57);
-      if (!alnum) break;
-      i++;
-    }
-    if (i > start) cb(lower, start, i - start);
-    i++;
-  }
-}
-
-function addWordTrigrams(out: Set<number>, lower: string, start: number, len: number): void {
-  // virtual padded word: [sp, sp, w0..w(len-1), sp]
-  const code = (j: number): number => {
-    if (j < 2 || j >= len + 2) return 0;
-    const ch = lower.charCodeAt(start + j - 2);
-    return ch >= 97 && ch <= 122 ? ch - 86 : ch - 47;
-  };
-  let t = (code(0) << 6) | code(1);
-  for (let j = 2; j < len + 3; j++) {
-    t = ((t << 6) | code(j)) & 0x3ffff;
-    out.add(t);
-  }
-}
-
-function trigramSet(s: string): Set<number> {
-  const out = new Set<number>();
-  eachWord(s, (lower, start, len) => addWordTrigrams(out, lower, start, len));
-  return out;
-}
-
-function wordTrigramSets(s: string): Array<Set<number>> {
-  const out: Array<Set<number>> = [];
-  eachWord(s, (lower, start, len) => {
-    const set = new Set<number>();
-    addWordTrigrams(set, lower, start, len);
-    out.push(set);
-  });
-  return out;
-}
-
-function countWords(s: string): number {
-  let n = 0;
-  eachWord(s, () => n++);
-  return n;
 }
 
 /**
@@ -194,7 +361,7 @@ export function registerSimilarityUdf(db: {
   createFunction: (name: string, opts: object) => unknown;
 }): void {
   let memoKey: string | null = null;
-  let memoSet: Set<number> | null = null;
+  const memo = new QueryTrigrams();
   db.createFunction('similarity', {
     arity: 2,
     deterministic: true,
@@ -203,14 +370,13 @@ export function registerSimilarityUdf(db: {
       const bs = String(b);
       if (bs !== memoKey) {
         memoKey = bs;
-        memoSet = trigramSet(bs);
+        queryTrigrams(bs, memo);
       }
-      return similarityToSet(String(a), memoSet!);
+      return similarityToQuery(String(a), memo);
     },
   });
   let wMemoKey: string | null = null;
-  let wMemoSet: Set<number> | null = null;
-  let wMemoWords = 0;
+  const wMemo = new QueryTrigrams();
   db.createFunction('word_similarity', {
     arity: 2,
     deterministic: true,
@@ -219,14 +385,13 @@ export function registerSimilarityUdf(db: {
       const qs = String(query);
       if (qs !== wMemoKey) {
         wMemoKey = qs;
-        wMemoSet = trigramSet(qs);
-        wMemoWords = countWords(qs);
+        queryTrigrams(qs, wMemo);
       }
-      return wordSimilarityToSet(wMemoSet!, wMemoWords, String(text));
+      return wordSimilarityToQuery(wMemo, String(text));
     },
   });
   let sMemoKey: string | null = null;
-  let sMemoSets: Array<Set<number>> | null = null;
+  let sMemoWords: Int32Array[] = [];
   db.createFunction('search_similarity', {
     arity: 2,
     deterministic: true,
@@ -235,9 +400,9 @@ export function registerSimilarityUdf(db: {
       const qs = String(query);
       if (qs !== sMemoKey) {
         sMemoKey = qs;
-        sMemoSets = wordTrigramSets(qs);
+        sMemoWords = queryWordTrigrams(qs);
       }
-      return searchSimilarityToSets(sMemoSets!, String(text));
+      return searchSimilarityToWords(sMemoWords, String(text));
     },
   });
 }

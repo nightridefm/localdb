@@ -23,6 +23,8 @@ import {
 import { makeApplier, type TableApplier } from '../sync/apply.ts';
 import { shapeStream, type ShapeCursor, type ShapeMessage } from '../sync/electric.ts';
 import { openEngine, resolveConnMode, type Engine, type Sqlite3Stmt } from './engine.ts';
+import { withWriteFence } from './fence.ts';
+import { ReadService } from './read-service.ts';
 import { opfsAvailable } from './vfs.ts';
 
 // Electric's global_last_seen_lsn is an integer string in every observed
@@ -36,8 +38,6 @@ function parseLsn(v: string | null | undefined): bigint {
     return 0n;
   }
 }
-import { withWriteFence } from './fence.ts';
-import { ReadService } from './read-service.ts';
 
 const post = (m: FromWriter | FromReader, transfer?: Transferable[]) =>
   (postMessage as (m: unknown, t?: Transferable[]) => void)(m, transfer);
@@ -138,6 +138,8 @@ type AlignedBatch = {
   lsn: bigint;
   enqueuedAt: number;
   applier: TableApplier;
+  /** The owning shape's failure hook: restarts it from its stored cursor. */
+  fail: (err: unknown) => void;
 };
 const alignHeads = new Map<string, bigint>();
 const alignLive = new Set<string>();
@@ -185,21 +187,28 @@ async function alignDrain(): Promise<void> {
     const e = engine!;
     const tables = new Set<string>();
     let rows = 0;
-    await withWriteDb(() => {
-      e.db.exec('BEGIN');
-      try {
-        for (const b of eligible) {
-          rows += b.applier.apply(b.messages);
-          tables.add(b.table);
-          persistCursor(b.table, b.cursor);
+    try {
+      await withWriteDb(() => {
+        e.db.exec('BEGIN');
+        try {
+          for (const b of eligible) {
+            rows += b.applier.apply(b.messages);
+            tables.add(b.table);
+            persistCursor(b.table, b.cursor);
+          }
+          e.db.exec('COMMIT');
+          e.flush();
+        } catch (err) {
+          e.db.exec('ROLLBACK');
+          throw err;
         }
-        e.db.exec('COMMIT');
-        e.flush();
-      } catch (err) {
-        e.db.exec('ROLLBACK');
-        throw err;
-      }
-    });
+      });
+    } catch (err) {
+      // The rolled-back batches are already out of the queue. Restart each
+      // affected shape from its stored cursor, which re-fetches all of it.
+      for (const b of eligible) b.fail(err);
+      throw err;
+    }
     broadcastCommit([...tables], rows);
     await rebuildIndexesIfPending([...tables]);
   }
@@ -327,7 +336,6 @@ async function rebuildIndexesIfPending(tables: string[]): Promise<void> {
       continue;
     }
     pendingIndexRebuild.delete(table);
-    const t0 = performance.now();
     await withWriteDb(() => {
       e.db.exec('BEGIN');
       try {
@@ -352,7 +360,6 @@ async function rebuildIndexesIfPending(tables: string[]): Promise<void> {
         rows: -1, // sentinel: index rebuild phase
       },
     });
-    void t0;
   }
 }
 
@@ -591,23 +598,51 @@ async function init(config: WriterInit) {
 // that failure mode. The transaction rolled back, so the stored cursor
 // still points at the last good commit; restarting runShape resumes from
 // there and re-applies idempotently.
+//
+// The loop is bound to the signal of the startSync that launched it, NOT
+// the module-level `abort`: a pause + resume replaces that controller, and
+// a loop sleeping out a retry would otherwise see the NEW, unaborted one
+// and start a second stream for the shape next to the one resume started.
 async function runShapeWithRetry(shape: WriterInit['shapes'][number]): Promise<void> {
+  const signal = abort.signal;
   for (;;) {
     try {
-      await runShape(shape);
+      await runShape(shape, signal);
       return; // stream ended (abort)
     } catch (err) {
       post({ t: 'error', error: `shape ${shape.table}: ${String((err as Error)?.stack || err)}` });
-      if (abort.signal.aborted) return;
+      if (signal.aborted) return;
       post({ t: 'status', status: { state: 'error', error: String(err), retryInMs: 5000 } });
       await new Promise((r) => setTimeout(r, 5000));
-      if (abort.signal.aborted) return;
+      if (signal.aborted) return;
     }
   }
 }
 
-async function runShape(shape: WriterInit['shapes'][number]) {
+async function runShape(shape: WriterInit['shapes'][number], signal: AbortSignal) {
   const e = engine!;
+  // A commit that fails off the main loop (coalesce timer, aligner) cannot
+  // throw into it. It records the error and aborts this shape's stream
+  // instead; the loop then rethrows, and runShapeWithRetry resumes from
+  // the stored cursor. Until then every commit refuses to run: one that
+  // succeeded after the failure would persist a cursor past the
+  // rolled-back rows and skip them for good.
+  const shapeAbort = new AbortController();
+  const onAbort = () => shapeAbort.abort();
+  signal.addEventListener('abort', onAbort, { once: true });
+  // Cast, not annotation: assigned only inside closures, so a plain
+  // `= null` would narrow it to null for the whole function body.
+  let failure = null as { err: unknown } | null;
+  const fail = (err: unknown) => {
+    failure ??= { err };
+    shapeAbort.abort();
+    // Queued aligned batches are uncommitted state from before the
+    // restart point: committing one later would persist a cursor past the
+    // rolled-back rows, or replay stale rows over the restarted stream's.
+    for (let i = alignQueue.length - 1; i >= 0; i--) {
+      if (alignQueue[i]!.table === shape.table) alignQueue.splice(i, 1);
+    }
+  };
   const applier = makeApplier(e, shape.table, shape.primaryKey, metaByTable.get(shape.table));
   const storedCursor = await withWriteDb(() =>
     e.db.selectValue(
@@ -656,6 +691,7 @@ async function runShape(shape: WriterInit['shapes'][number]) {
     pendingRows = 0;
     let rows = 0;
     await withWriteDb(() => {
+      if (failure) throw failure.err;
       e.db.exec('BEGIN');
       try {
         rows = applier.apply(batch);
@@ -670,6 +706,9 @@ async function runShape(shape: WriterInit['shapes'][number]) {
         e.db.exec('ROLLBACK');
         throw err;
       }
+    }).catch((err: unknown) => {
+      fail(err);
+      throw err;
     });
     broadcastCommit([shape.table], rows);
     if (upToDate) await rebuildIndexesIfPending([shape.table]);
@@ -679,107 +718,124 @@ async function runShape(shape: WriterInit['shapes'][number]) {
     }
   };
 
-  for await (const batch of shapeStream({
-    url: shape.url,
-    params: shape.params,
-    cursor,
-    signal: abort.signal,
-    onRetry: (err, delayMs, httpStatus) =>
-      post({
-        t: 'status',
-        status: { state: 'error', error: String(err), retryInMs: delayMs, httpStatus },
-      }),
-  })) {
-    if (batch.mustRefetch) {
-      // A pending coalesced commit would persist a pre-refetch cursor over
-      // the reset - cancel it along with the buffered messages.
-      if (coalesceTimer) {
-        clearTimeout(coalesceTimer);
-        coalesceTimer = null;
-      }
-      coalesceCursor = null;
-      // Aligned batches for this table are pre-refetch state too.
-      for (let i = alignQueue.length - 1; i >= 0; i--) {
-        if (alignQueue[i]!.table === shape.table) alignQueue.splice(i, 1);
-      }
-      await withWriteDb(() => {
-        e.db.exec('BEGIN');
-        applier.truncate();
-        runBound(`DELETE FROM _ldb_shape WHERE table_name=?`, [shapeCursorKey(shape.table)]);
-        e.db.exec('COMMIT');
-        e.flush();
-        // The refetch re-hydrates the whole shape - do it index-free.
-        captureAndDropIndexes(shape.table);
-      });
-      broadcastCommit([shape.table], 0);
-      pending = [];
-      pendingRows = 0;
-      continue;
-    }
-    for (const m of batch.messages) {
-      // Change messages AND headers-only move-out events reach the applier;
-      // pure control messages (up-to-date / snapshot-end) do not.
-      if (m.headers.operation || m.headers.event === 'move-out') pending.push(m);
-    }
-    pendingRows = pending.length;
-    if (pendingRows >= MAX_BATCH_ROWS) {
-      // Hydration chunk - commit immediately, never coalesce (latency to
-      // first paint beats flush amortization here).
-      post({
-        t: 'status',
-        status: { state: 'initial-sync', table: shape.table, rows: pendingRows },
-      });
-      await commit(false, batch.cursor);
-    } else if (batch.upToDate) {
-      if (!liveOnce || (coalesceMs <= 0 && !alignEnabled)) {
-        // First up-to-date (initial snapshot) - commit now for fast boot.
-        await commit(true, batch.cursor);
-        if (alignEnabled) {
-          // Seed the aligner so other shapes' heads have a reference.
-          alignHeads.set(shape.table, parseLsn(batch.upToDateLsn));
-          alignLive.add(shape.table);
+  try {
+    for await (const batch of shapeStream({
+      url: shape.url,
+      params: shape.params,
+      cursor,
+      signal: shapeAbort.signal,
+      onRetry: (err, delayMs, httpStatus) =>
+        post({
+          t: 'status',
+          status: { state: 'error', error: String(err), retryInMs: delayMs, httpStatus },
+        }),
+    })) {
+      if (batch.mustRefetch) {
+        // A pending coalesced commit would persist a pre-refetch cursor over
+        // the reset - cancel it along with the buffered messages.
+        if (coalesceTimer) {
+          clearTimeout(coalesceTimer);
+          coalesceTimer = null;
         }
-      } else if (alignEnabled) {
-        // Live steady state, aligned: hand the batch to the cross-shape
-        // committer (it owns pacing; per-shape coalescing is bypassed).
-        const msgs = pending;
+        coalesceCursor = null;
+        // Aligned batches for this table are pre-refetch state too.
+        for (let i = alignQueue.length - 1; i >= 0; i--) {
+          if (alignQueue[i]!.table === shape.table) alignQueue.splice(i, 1);
+        }
+        await withWriteDb(() => {
+          e.db.exec('BEGIN');
+          applier.truncate();
+          runBound(`DELETE FROM _ldb_shape WHERE table_name=?`, [shapeCursorKey(shape.table)]);
+          e.db.exec('COMMIT');
+          e.flush();
+          // The refetch re-hydrates the whole shape - do it index-free.
+          captureAndDropIndexes(shape.table);
+        });
+        broadcastCommit([shape.table], 0);
         pending = [];
         pendingRows = 0;
-        alignFeed({
-          table: shape.table,
-          messages: msgs,
-          cursor: batch.cursor,
-          lsn: parseLsn(batch.upToDateLsn),
-          enqueuedAt: performance.now(),
-          applier,
+        continue;
+      }
+      for (const m of batch.messages) {
+        // Change messages AND headers-only move-out events reach the applier;
+        // pure control messages (up-to-date / snapshot-end) do not.
+        if (m.headers.operation || m.headers.event === 'move-out') pending.push(m);
+      }
+      pendingRows = pending.length;
+      if (pendingRows >= MAX_BATCH_ROWS) {
+        // Hydration chunk - commit immediately, never coalesce (latency to
+        // first paint beats flush amortization here).
+        post({
+          t: 'status',
+          status: { state: 'initial-sync', table: shape.table, rows: pendingRows },
         });
-      } else {
-        // Live steady state - leading-edge throttle. If the last commit
-        // (any shape) is older than the window, commit NOW: an isolated
-        // mutation pays zero coalescing latency. Only churn inside the
-        // window buffers, and then only for the REMAINDER of the window;
-        // a pending trailing timer just absorbs the batch.
-        coalesceCursor = batch.cursor;
-        if (!coalesceTimer) {
-          const sinceLast = performance.now() - lastCommitAt;
-          if (sinceLast >= coalesceMs) {
-            const cur = coalesceCursor;
-            coalesceCursor = null;
-            await commit(true, cur);
-          } else {
-            coalesceTimer = setTimeout(
-              () => {
-                coalesceTimer = null;
-                const cur = coalesceCursor;
-                coalesceCursor = null;
-                if (cur) void commit(true, cur).catch(onShapeError);
-              },
-              Math.max(1, coalesceMs - sinceLast)
-            );
+        await commit(false, batch.cursor);
+      } else if (batch.upToDate) {
+        if (!liveOnce || (coalesceMs <= 0 && !alignEnabled)) {
+          // First up-to-date (initial snapshot) - commit now for fast boot.
+          await commit(true, batch.cursor);
+          if (alignEnabled) {
+            // Seed the aligner so other shapes' heads have a reference.
+            alignHeads.set(shape.table, parseLsn(batch.upToDateLsn));
+            alignLive.add(shape.table);
+          }
+        } else if (alignEnabled) {
+          // Live steady state, aligned: hand the batch to the cross-shape
+          // committer (it owns pacing; per-shape coalescing is bypassed).
+          const msgs = pending;
+          pending = [];
+          pendingRows = 0;
+          alignFeed({
+            table: shape.table,
+            messages: msgs,
+            cursor: batch.cursor,
+            lsn: parseLsn(batch.upToDateLsn),
+            enqueuedAt: performance.now(),
+            applier,
+            fail,
+          });
+        } else {
+          // Live steady state - leading-edge throttle. If the last commit
+          // (any shape) is older than the window, commit NOW: an isolated
+          // mutation pays zero coalescing latency. Only churn inside the
+          // window buffers, and then only for the REMAINDER of the window;
+          // a pending trailing timer just absorbs the batch.
+          coalesceCursor = batch.cursor;
+          if (!coalesceTimer) {
+            const sinceLast = performance.now() - lastCommitAt;
+            if (sinceLast >= coalesceMs) {
+              const cur = coalesceCursor;
+              coalesceCursor = null;
+              await commit(true, cur);
+            } else {
+              coalesceTimer = setTimeout(
+                () => {
+                  coalesceTimer = null;
+                  const cur = coalesceCursor;
+                  coalesceCursor = null;
+                  // commit() has already routed the error to fail(); still
+                  // log it, since a timer firing after the stream ended (a
+                  // pause) has no loop left to rethrow it.
+                  if (cur) void commit(true, cur).catch(onShapeError);
+                },
+                Math.max(1, coalesceMs - sinceLast)
+              );
+            }
           }
         }
       }
     }
+  } catch (err) {
+    // Aborting mid-read surfaces as an AbortError; the recorded failure is
+    // the real cause.
+    if (failure) throw failure.err;
+    throw err;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+  if (failure) {
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    throw failure.err;
   }
 }
 

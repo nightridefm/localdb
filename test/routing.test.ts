@@ -301,4 +301,27 @@ console.log('no-attach: dispatch unchanged ok');
 }
 console.log('single mode: cross-db fails closed, single-db unaffected ok');
 
+// ── unsubscribe is idempotent across a re-subscribe of the same key ─────
+{
+  const h = harness({ readers: 2 });
+  const spec = { sql: plainSql('link') };
+  const stopOld = h.db.subscribe(spec, () => {});
+  stopOld();
+  h.db.subscribe(spec, () => {});
+  // A stale second call (double cleanup) must not touch the live sub.
+  stopOld();
+  const count = (t: string) => h.readers.flatMap((r) => r.sent).filter((m) => m.t === t).length;
+  assert.equal(count('subscribe'), 2);
+  assert.equal(count('unsubscribe'), 1, 'stale unsubscribe sends nothing');
+  const r = h.readers.find((w) => w.sent.some((m) => m.t === 'subscribe'))!;
+  const key = (r.sent.find((m) => m.t === 'subscribe') as { key: string }).key;
+  r.deliver({
+    t: 'r-results',
+    batch: [{ key, version: 1, commitSeq: 1, bytes: new TextEncoder().encode('[]') }],
+  });
+  assert.ok(h.db.peek(spec), 'the live subscription still receives results');
+  h.db.destroy();
+}
+console.log('unsubscribe: idempotent across re-subscribe ok');
+
 console.log('routing.test.ts: all assertions passed');

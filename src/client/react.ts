@@ -55,7 +55,9 @@ export function useLiveQuery<Row = unknown>(db: LocalDb, spec: QuerySpec): LiveQ
     [db, stableSpec]
   );
   const getSnapshot = useCallback((): LiveQueryState<Row> => {
-    const snap = db.peek<Row>(stableSpec);
+    // By the render's key: the same key subscribe() derives from
+    // stableSpec, without re-hashing the SQL on every call.
+    const snap = db.peekKey<Row>(specKey);
     if (snap === cache.last) return cache.mapped;
     cache.last = snap;
     cache.mapped = snap
@@ -67,7 +69,7 @@ export function useLiveQuery<Row = unknown>(db: LocalDb, spec: QuerySpec): LiveQ
         }
       : (LOADING as LiveQueryState<Row>);
     return cache.mapped;
-  }, [db, stableSpec, cache]);
+  }, [db, specKey, cache]);
 
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }

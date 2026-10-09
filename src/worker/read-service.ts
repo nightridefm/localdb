@@ -35,6 +35,8 @@ export type ReadMode = 'fence' | 'seqlock';
 const DEFAULT_MAX_UPDATE_HZ = 10;
 const TICK_HIDDEN_MS = 1000;
 const SEQLOCK_MAX_ATTEMPTS = 4;
+/** Primary result codes of a torn read: SQLITE_IOERR, SQLITE_CORRUPT, SQLITE_NOTADB. */
+const TORN_READ_CODES = new Set([10, 11, 26]);
 
 export class ReadService {
   private registry = new QueryRegistry();
@@ -95,6 +97,20 @@ export class ReadService {
   }
 
   /**
+   * Reads outside the query path: prepare-time dependency extraction and
+   * the advisor's probes. In fence mode they take the fence like any read.
+   * An unfenced prepare can walk a schema page mid-commit (the index
+   * rebuild after hydration rewrites sqlite_schema), and a torn walk can
+   * poison the pager - which fence mode, unlike seqlock, never repairs by
+   * reopening, so every later query on this reader would fail. Seqlock
+   * stays lock-free here as everywhere; a poisoned pager surfaces as a
+   * corrupt read on the next tick and is reopened there.
+   */
+  private async metaRead<T>(fn: () => T): Promise<T> {
+    return this.mode === 'fence' ? this.withReadDb(fn) : fn();
+  }
+
+  /**
    * A commit landed on some database this service reads. `origin` is the
    * ATTACH alias the notice arrived for, or undefined for this db's own
    * commits; the notice carries LOCAL table names, so an attached db's are
@@ -131,9 +147,7 @@ export class ReadService {
     const existing = this.registry.get(key);
     const deps = existing
       ? existing.deps
-      : this.engine.baton
-        ? await this.withReadDb(() => this.engine.tablesRead(spec.sql))
-        : this.engine.tablesRead(spec.sql);
+      : await this.metaRead(() => this.engine.tablesRead(spec.sql));
     const e = this.registry.subscribe(key, spec, deps);
     if (existing) {
       // (Re)attaching to a warm entry: the subscriber has NO client-side
@@ -167,7 +181,7 @@ export class ReadService {
         const label = sizes.map(([t, n]) => `${t}${n > 200 ? '>200' : `≈${n}`}`).join(', ');
         return notes.map((n) => `${n} [${label} rows]`);
       };
-      const notes = this.engine.baton ? await this.withReadDb(evaluate) : evaluate();
+      const notes = await this.metaRead(evaluate);
       if (notes) this.post({ t: 'r-advice', key, sql: spec.sql, notes });
     }
     // First result immediately - never wait a tick for mount.
@@ -191,9 +205,7 @@ export class ReadService {
     const report: AnalyzeEntry[] = [];
     for (const q of queries) {
       try {
-        const deps = this.engine.baton
-          ? await this.withReadDb(() => this.engine.tablesRead(q.sql))
-          : this.engine.tablesRead(q.sql);
+        const deps = await this.metaRead(() => this.engine.tablesRead(q.sql));
         const entry: AnalyzeEntry = { sql: q.sql, ms: -1, bytes: 0, plan: [], deps: [] };
         await this.withReadDb(() => {
           entry.plan = this.engine.explainPlan(q.sql);
@@ -263,12 +275,17 @@ export class ReadService {
     }
     let poisoned = false;
     for (let attempt = 0; attempt < SEQLOCK_MAX_ATTEMPTS; attempt++) {
+      let v1: number | null = null;
       try {
-        const v1 = this.engine.dataVersion();
+        v1 = this.engine.dataVersion();
         const result = fn();
         if (this.engine.dataVersion() === v1) return result;
         // A commit landed mid-read: result may be torn - discard and retry.
-      } catch {
+      } catch (err) {
+        // A plain query error (bad SQL, a missing attached table) is not a
+        // torn read: retrying cannot fix it, and every reopen flushes the
+        // statement and dependency caches of EVERY query on this reader.
+        if (!this.mightBeTorn(err, v1)) throw err;
         // Torn page walk mid-commit. SQLITE_CORRUPT poisons the pager cache
         // (observed: even pragma reads fail afterwards) - reopen the
         // connection before retrying. Cheap (~1-3ms), and rare.
@@ -294,6 +311,23 @@ export class ReadService {
       }
       return fn();
     });
+  }
+
+  /**
+   * Could this read error come from a commit landing mid-read? Yes for the
+   * corruption-class result codes a torn page walk produces, when the
+   * version sample itself failed, or when a commit did land; anything
+   * else is the query's own error.
+   */
+  private mightBeTorn(err: unknown, v1: number | null): boolean {
+    const rc = (err as { resultCode?: unknown } | null)?.resultCode;
+    if (typeof rc === 'number' && TORN_READ_CODES.has(rc & 0xff)) return true;
+    if (v1 === null) return true;
+    try {
+      return this.engine.dataVersion() !== v1;
+    } catch {
+      return true;
+    }
   }
 
   private scheduleTick(): void {

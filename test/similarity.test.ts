@@ -167,5 +167,28 @@ assert.equal(
   'search_similarity NULL argument yields NULL'
 );
 
+// ── allocation-free implementation edge cases ──────────────────────────
+// Unicode lowercasing can yield ASCII (KELVIN SIGN -> 'k'): the fast
+// ASCII parse must defer to toLowerCase() for any non-ASCII input.
+assert.equal(trigramSimilarity('Kelvin', 'kelvin'), 1, 'KELVIN SIGN folds to k');
+assert.equal(trigramSimilarity('NEON', 'neon'), 1, 'ASCII uppercase folds inline');
+// Repeated trigrams inside one word count once (set semantics).
+assert.equal(trigramSimilarity('aaaa', 'aa'), trigramSimilarity('aa', 'aaaa'));
+assert.equal(searchSimilarity('aaaa', 'aaaa aaaa'), 1);
+// Rows longer than the initial scratch buffers grow them correctly.
+{
+  const long = Array.from({ length: 400 }, (_, i) => `word${i}`).join(' ');
+  assert.equal(searchSimilarity('word399', long), 1, 'last word of a long row still found');
+  assert.equal(wordSimilarity('word0 word1', long), 1);
+}
+// Two memoized queries interleaved per row in ONE statement: each UDF
+// keeps its own query trigrams.
+{
+  const both = db.selectValue(
+    `SELECT search_similarity('vosto', 'Vosto - Neon') || ',' || word_similarity('neon', 'Vosto - Neon') || ',' || similarity('Vosto - Neon', 'xyz')`
+  );
+  assert.equal(both, '1,1,0');
+}
+
 db.close();
 console.log('similarity.test.ts: all assertions passed');

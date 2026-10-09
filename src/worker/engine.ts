@@ -110,6 +110,20 @@ export function embedExpr(n: string, hints: EmbedHints = NO_HINTS): string {
 }
 
 /**
+ * The whole-result JSON wrapper around a SELECT whose result columns are
+ * `names`. json_object() goes straight into json_group_array() so the
+ * aggregate sees the JSON subtype and embeds each row as-is. Routing it
+ * through a subquery column instead drops the subtype, and the
+ * json(__row) that then has to restore it re-parses every row: 2x the
+ * wrapper cost on a 20k-row result for byte-identical output.
+ * json_group_array over zero rows is already '[]'. Exported for tests.
+ */
+export function wrapJsonSql(sql: string, names: string[], hints: EmbedHints = NO_HINTS): string {
+  const cols = names.map((n) => embedExpr(n, hints)).join(', ');
+  return `SELECT json_group_array(json_object(${cols})) FROM (${sql})`;
+}
+
+/**
  * Advisor classifier for one EXPLAIN QUERY PLAN detail line: does it
  * describe a genuinely UNINDEXED scan of a user table? Exported for tests.
  *
@@ -515,10 +529,7 @@ export async function openEngine(opts: {
     // delivers parsed values - but through a json_valid guard, since a
     // name collision with a plain text column (or pre-coercion residue)
     // must degrade to raw text, not error.
-    const cols = names.map((n) => embedExpr(n, hints)).join(', ');
-    const wrapped = `SELECT COALESCE(json_group_array(json(__row)), '[]') FROM (
-			SELECT json_object(${cols}) AS __row FROM (${sql})
-		)`;
+    const wrapped = wrapJsonSql(sql, names, hints);
     wrappedCache.set(sql, wrapped);
     return wrapped;
   }

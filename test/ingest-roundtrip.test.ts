@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 
 import { ddlFor, models, rowJson } from '../examples/models.ts';
 import { makeApplier } from '../src/sync/apply.ts';
-import { embedExpr, embedHints } from '../src/worker/engine.ts';
+import { embedHints, wrapJsonSql } from '../src/worker/engine.ts';
 import { initSqlite } from './init-sqlite.ts';
 
 const sqlite3 = await initSqlite();
@@ -24,7 +24,8 @@ const hints = embedHints(models);
 // makeApplier only touches engine.db - a raw handle stands in for Engine.
 const engine = { db } as unknown as Parameters<typeof makeApplier>[0];
 
-// The engine's read wrapper, reproduced through the REAL embedExpr.
+// The engine's read wrapper: the column probe is reproduced, the SQL is
+// the shipped wrapJsonSql.
 function queryRows(sql: string): Record<string, unknown>[] {
   const probe = db.prepare(sql);
   const names: string[] = [];
@@ -32,10 +33,10 @@ function queryRows(sql: string): Record<string, unknown>[] {
     names.push((probe as unknown as { getColumnName: (i: number) => string }).getColumnName(i));
   }
   probe.finalize();
-  const wrapped = `SELECT COALESCE(json_group_array(json(__row)), '[]') FROM (
-		SELECT json_object(${names.map((n) => embedExpr(n, hints)).join(', ')}) AS __row FROM (${sql})
-	)`;
-  return JSON.parse(String(db.selectValue(wrapped))) as Record<string, unknown>[];
+  return JSON.parse(String(db.selectValue(wrapJsonSql(sql, names, hints)))) as Record<
+    string,
+    unknown
+  >[];
 }
 
 function insert(model: keyof typeof models, value: Record<string, string | null>) {
@@ -139,6 +140,16 @@ plApplier.apply([
   } as Parameters<typeof plApplier.apply>[0][number],
 ]);
 assert.equal(db.selectValue(`SELECT count(*) FROM playlist WHERE show_on_home`), 0);
+
+// ── wrapper shape: empty result, row order, nested JSON not re-escaped ──
+assert.deepEqual(queryRows(`SELECT * FROM artist WHERE 0`), []);
+assert.deepEqual(
+  queryRows(`SELECT id FROM artist ORDER BY id DESC`).map((r) => r.id),
+  ['a2', 'a1']
+);
+assert.deepEqual(queryRows(`SELECT json_array(1, 'x') AS v__json, id FROM artist WHERE id='a1'`), [
+  { v: [1, 'x'], id: 'a1' },
+]);
 
 db.close();
 console.log('ingest-roundtrip.test.ts: all assertions passed');
