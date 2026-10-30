@@ -212,11 +212,12 @@ export class LocalDb {
         schemaVersion: config.schemaVersion,
         writeCoalesceMs: config.writeCoalesceMs,
         alignShapes: config.alignShapes,
-        readMode: config.readMode,
+        readMode: config.alignCommits ? 'fence' : config.readMode,
         advise: config.advise,
         maxUpdateHz: config.maxUpdateHz,
         fts: config.fts,
         shapes: config.shapes,
+        sync: config.sync,
         models: config.models,
       },
     });
@@ -342,7 +343,7 @@ export class LocalDb {
         t: 'r-init',
         dbName: this.config.dbName,
         connMode: this.connMode === 'baton' ? 'baton' : 'multi',
-        readMode: this.config.readMode,
+        readMode: this.config.alignCommits ? 'fence' : this.config.readMode,
         advise: this.config.advise,
         maxUpdateHz: this.config.maxUpdateHz,
         models: this.readerModels,
@@ -621,9 +622,16 @@ export class LocalDb {
   private readerFor(key: QueryKey, sql: string): number {
     let idx = this.subReader.get(key);
     if (idx === undefined) {
-      const lane = this.isCrossDb(sql) ? this.wideCount() : this.readers.length;
-      const table = routingTable(sql);
-      idx = (table ? hashString(table) : hashString(key)) % lane;
+      if (this.config.alignCommits) {
+        // One reader for every live query: a tick reads them all in one
+        // snapshot and posts them in one message, so a render never mixes
+        // commits. Reader 0 is always wide (it can run cross-db queries).
+        idx = 0;
+      } else {
+        const lane = this.isCrossDb(sql) ? this.wideCount() : this.readers.length;
+        const table = routingTable(sql);
+        idx = (table ? hashString(table) : hashString(key)) % lane;
+      }
       this.subReader.set(key, idx);
     }
     return idx;
@@ -835,6 +843,14 @@ export class LocalDb {
 
   resumeSync(): void {
     this.send(this.writer, { t: 'resume' });
+  }
+
+  /**
+   * Sends a command to the active sync transport (LocalDbConfig.sync), e.g.
+   * `{ want: [...] }` to change what localsync syncs. Ignored by Electric.
+   */
+  syncCommand(payload: unknown): void {
+    this.send(this.writer, { t: 'sync-command', payload });
   }
 
   destroy(): void {

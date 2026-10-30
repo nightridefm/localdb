@@ -92,7 +92,9 @@ export type ToWriter =
    * and honours it if later promoted to leader.
    */
   | { t: 'pause' }
-  | { t: 'resume' };
+  | { t: 'resume' }
+  /** LocalDb.syncCommand: forwarded to the active sync transport. */
+  | { t: 'sync-command'; payload: unknown };
 
 export type WriterInit = {
   dbName: string;
@@ -116,6 +118,8 @@ export type WriterInit = {
   models?: Record<string, ModelMeta>;
   /** Testing override: skip capability detection and force a tier. */
   forceConnMode?: 'multi' | 'baton' | 'single';
+  /** See LocalDbConfig.sync. */
+  sync?: { transport: string; options?: unknown };
   shapes: Array<{
     table: string;
     primaryKey: string[];

@@ -22,6 +22,12 @@ import {
 } from '../protocol.ts';
 import { makeApplier, type TableApplier } from '../sync/apply.ts';
 import { shapeStream, type ShapeCursor, type ShapeMessage } from '../sync/electric.ts';
+import {
+  syncTransport,
+  type SqlValue,
+  type SyncTransport,
+  type TransportDb,
+} from '../sync/transport.ts';
 import { openEngine, resolveConnMode, type Engine, type Sqlite3Stmt } from './engine.ts';
 import { withWriteFence } from './fence.ts';
 import { ReadService } from './read-service.ts';
@@ -418,11 +424,83 @@ async function anyTabVisible(dbName: string): Promise<boolean> {
   return (q.held ?? []).some((l) => l.name === visibleLockName(dbName));
 }
 
+// ── Pluggable transport (LocalDbConfig.sync) ────────────────────────────────
+// Replaces the shape streams when configured. Writes go through the same
+// write fence and commit broadcast as Electric batches.
+let transport: SyncTransport | null = null;
+
+function transportDb(e: Engine): TransportDb {
+  // Statements cached by SQL text: the transport re-runs the same few.
+  const stmts = new Map<string, Sqlite3Stmt>();
+  const stmt = (sql: string) => {
+    let s = stmts.get(sql);
+    if (!s) {
+      s = e.db.prepare(sql);
+      stmts.set(sql, s);
+    }
+    return s;
+  };
+  return {
+    exec(sql: string, bind?: SqlValue[]) {
+      if (!bind?.length) {
+        e.db.exec(sql);
+        return;
+      }
+      const s = stmt(sql);
+      try {
+        s.bind(bind).stepReset();
+      } catch (err) {
+        s.reset();
+        throw err;
+      }
+    },
+    all(sql: string, bind?: SqlValue[]) {
+      const s = stmt(sql);
+      const out: SqlValue[][] = [];
+      try {
+        if (bind?.length) s.bind(bind);
+        while (s.step()) {
+          const row: SqlValue[] = [];
+          for (let i = 0; i < s.columnCount; i++) row.push(s.get(i) as SqlValue);
+          out.push(row);
+        }
+      } finally {
+        s.reset();
+      }
+      return out;
+    },
+  };
+}
+
+function startTransport(name: string, options: unknown): boolean {
+  const factory = syncTransport(name);
+  if (!factory) {
+    post({ t: 'error', error: `sync transport '${name}' is not registered in this writer worker` });
+    return false;
+  }
+  const db = transportDb(engine!);
+  transport = factory(
+    {
+      run: (fn) => withWriteDb(() => fn(db)),
+      committed: (tables, rows) => broadcastCommit(tables, rows),
+      status: postStatus,
+      log: (message) => post({ t: 'error', error: message }),
+    },
+    options
+  );
+  transport.start();
+  return true;
+}
+
 function startSync(): void {
   if (syncRunning || !syncConfig) return;
   syncRunning = true;
   abort = new AbortController();
   postStatus({ state: 'connecting' });
+  if (syncConfig.sync) {
+    if (!startTransport(syncConfig.sync.transport, syncConfig.sync.options)) syncRunning = false;
+    return;
+  }
   for (const shape of syncConfig.shapes) void runShapeWithRetry(shape);
 }
 
@@ -430,6 +508,8 @@ function stopSync(): void {
   if (!syncRunning) return;
   syncRunning = false;
   abort.abort();
+  transport?.stop();
+  transport = null;
   postStatus({ state: 'paused' });
 }
 
@@ -862,6 +942,8 @@ onmessage = (ev: MessageEvent<ToWriter | Exclude<ToReader, { t: 'r-init' }>>) =>
       if (pauseWhenHidden) void evaluatePause();
       else startSync();
     }
+  } else if (m.t === 'sync-command') {
+    transport?.command?.(m.payload);
   } else if (m.t === 'subscribe') {
     // single mode: reads are hosted here (SAHPool allows one connection).
     if (readService) void readService.subscribe(m.key, m.spec).catch(fail);
@@ -893,3 +975,7 @@ onmessage = (ev: MessageEvent<ToWriter | Exclude<ToReader, { t: 'r-init' }>>) =>
     }
   }
 };
+
+// Apps register alternative sync transports from their writer worker entry
+// (see sync/transport.ts).
+export { registerSyncTransport } from '../sync/transport.ts';

@@ -137,6 +137,13 @@ export type LocalDbConfig = {
   schemaVersion: number;
   shapes: ShapeDef[];
   /**
+   * Use a registered sync transport instead of Electric shape streams (see
+   * sync/transport.ts). `options` must be structured-cloneable: it is sent
+   * to the writer worker, where the transport registered under `transport`
+   * receives it. `shapes` is ignored (may be empty) when this is set.
+   */
+  sync?: { transport: string; options?: unknown };
+  /**
    * Model metadata keyed by model name (see ModelMeta). Required for any
    * synced table with boolean, JSON, or scalar-list columns - without it
    * those values are stored and delivered as the raw wire text. Plain
@@ -228,6 +235,19 @@ export type LocalDbConfig = {
    * streams. Initial hydration commits unaligned. Default off.
    */
   alignShapes?: boolean | { maxSkewMs?: number };
+  /**
+   * Live queries never render from different commits. Without it, live
+   * queries are spread over the reader pool by table, each reader re-runs
+   * its own on its own tick, and one render can show one query at a new
+   * commit and another at an older one (a task beside a stale comment
+   * count) - measured in localsync's collab soak at 93% of render turns
+   * under two people's steady edits. With it, every live query runs on
+   * one reader: each tick reads them all in ONE snapshot (fence reads) and
+   * posts them in one message, delivered in one render. One-shot queries
+   * still use the whole pool. Costs live-query parallelism, so turn it on
+   * when screens combine several live queries that must agree. Default off.
+   */
+  alignCommits?: boolean;
   /**
    * Dev-mode index advisor: on first registration of each query, run
    * EXPLAIN QUERY PLAN and surface full-table SCANs via onAdvice.

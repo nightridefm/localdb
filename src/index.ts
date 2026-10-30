@@ -19,3 +19,10 @@ export type {
   CommitNotice,
   Unsubscribe,
 } from './types.ts';
+export type {
+  SqlValue as TransportSqlValue,
+  SyncTransport,
+  SyncTransportFactory,
+  TransportContext,
+  TransportDb,
+} from './sync/transport.ts';
