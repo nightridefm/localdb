@@ -53,7 +53,12 @@ onmessage = async (ev: MessageEvent<ToReader>) => {
           return e;
         });
       } else {
-        engine = await open();
+        // Under the fence too: the open reads the header and schema pages,
+        // and a commit landing mid-read tears them. In fence mode nothing
+        // reopens a poisoned pager, so every later query on this reader
+        // would fail SQLITE_CORRUPT (seen when the first sync frame lands
+        // while the readers boot).
+        engine = await withReadFences(fences, open);
       }
       svc = new ReadService(engine, fences, post, {
         readMode: m.readMode,
