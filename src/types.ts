@@ -279,8 +279,9 @@ export type LocalDbConfig = {
    */
   parkHiddenAfterMs?: number;
   /**
-   * Battery saver: park the Electric streams entirely while EVERY tab of
-   * this database is hidden, resuming from the stored cursors on unhide.
+   * Battery saver: park the sync (Electric shape streams or the registered
+   * transport) entirely while EVERY tab of this database is hidden,
+   * resuming from the stored cursors on unhide.
    * Tab visibility is tracked via a shared Web Lock census, so a hidden
    * leader keeps syncing as long as any other tab is visible, and crashed
    * tabs can never wedge the census. Default off (visibility throttling

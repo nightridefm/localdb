@@ -87,8 +87,8 @@ export type ToWriter =
   | { t: 'visibility'; hidden: boolean }
   /**
    * Manual sync pause/resume (LocalDb.pauseSync/resumeSync). Pause stops
-   * the Electric streams (data + cursors stay put); resume restarts them
-   * from the stored cursors. Per-tab: a standby writer records the flag
+   * the sync - the Electric shape streams or the registered transport
+   * (data + cursors stay put); resume restarts it from the stored cursors. Per-tab: a standby writer records the flag
    * and honours it if later promoted to leader.
    */
   | { t: 'pause' }

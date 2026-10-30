@@ -652,7 +652,9 @@ async function init(config: WriterInit) {
   void navigator.locks.request(writerLockName(config.dbName), { mode: 'exclusive' }, async () => {
     isLeader = true;
     leaseLogged = true;
-    console.info(`[localdb] ${config.dbName}: sync leader - THIS tab owns the Electric streams`);
+    console.info(
+      `[localdb] ${config.dbName}: sync leader - THIS tab runs the sync (Electric shapes or a registered transport)`
+    );
     if (manualPause || (pauseWhenHidden && !(await anyTabVisible(config.dbName)))) {
       postStatus({ state: 'paused' });
     } else {
