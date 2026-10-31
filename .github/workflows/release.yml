@@ -1,0 +1,37 @@
+# A version tag (v0.1.0) attaches the packed package to a GitHub release, so
+# apps install a built tarball instead of building from git on install:
+#   https://github.com/nightridefm/localdb/releases/download/v0.1.0/nightride-localdb-0.1.0.tgz
+# The tag must match package.json's version (bump it first).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: tag matches version
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != package.json version $v"; exit 1; }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm lint
+      - run: pnpm test
+      # pack runs prepare (scripts/build-dist.mjs), so the tarball carries dist/.
+      - run: pnpm pack
+      - name: release
+        run: gh release create "$GITHUB_REF_NAME" *.tgz --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
