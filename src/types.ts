@@ -303,6 +303,11 @@ export type CommitNotice = {
 export type SyncStatus =
   | { state: 'connecting' }
   | { state: 'initial-sync'; table: string; rows: number }
+  /**
+   * Caught up. With a transport (LocalDbConfig.sync): every subscription
+   * the server serves is in the local database, at one point in time.
+   * Electric shapes: a shape reached up-to-date.
+   */
   | { state: 'live' }
   | { state: 'paused' }
   /**
@@ -316,6 +321,19 @@ export type SyncStatus =
    * own identity or permissions.
    */
   | { state: 'error'; error: string; retryInMs: number; httpStatus?: number }
+  /**
+   * Part of the subscription is not served; everything else keeps syncing
+   * (after 'live', it is caught up). Reported by transports. `permanent`:
+   * the server refused it (unknown rule, not allowed, bad parameters), so
+   * retrying cannot help: a client/server mismatch or a bug the app should
+   * surface. Otherwise the server cannot evaluate it right now and keeps
+   * retrying; 'live' follows once everything is served again.
+   */
+  | {
+      state: 'failed';
+      error: string;
+      failures: Array<{ name: string; error: string; permanent: boolean }>;
+    }
   /**
    * TERMINAL: this environment cannot run the local DB (no retry will
    * follow). The app should tell the user plainly instead of spinning.
