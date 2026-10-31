@@ -358,13 +358,10 @@ async function rebuildIndexesIfPending(tables: string[]): Promise<void> {
         throw err;
       }
     });
-    post({
-      t: 'status',
-      status: {
-        state: 'initial-sync',
-        table,
-        rows: -1, // sentinel: index rebuild phase
-      },
+    postStatus({
+      state: 'initial-sync',
+      table,
+      rows: -1, // sentinel: index rebuild phase
     });
   }
 }
@@ -428,6 +425,9 @@ async function anyTabVisible(dbName: string): Promise<boolean> {
 // Replaces the shape streams when configured. Writes go through the same
 // write fence and commit broadcast as Electric batches.
 let transport: SyncTransport | null = null;
+// Bumped by every start and stop, so a stopped transport's late statuses
+// are dropped.
+let transportGen = 0;
 
 function transportDb(e: Engine): TransportDb {
   // Statements cached by SQL text: the transport re-runs the same few.
@@ -479,11 +479,34 @@ function startTransport(name: string, options: unknown): boolean {
     return false;
   }
   const db = transportDb(engine!);
+  const gen = ++transportGen;
+  // FTS mirrors (and any deferred indexes) are created and rebuilt when the
+  // transport is caught up, as the shape path does on up-to-date; 'live'
+  // waits for them so search works once it is reported. Statuses go through
+  // one chain to keep their order (a 'failed' right after 'live' must not
+  // overtake it).
+  let chain = Promise.resolve();
+  const status = (s: SyncStatus) => {
+    chain = chain.then(async () => {
+      if (gen !== transportGen) return;
+      if (s.state === 'live') {
+        try {
+          await rebuildIndexesIfPending([
+            ...new Set([...ftsSpecs.keys(), ...pendingIndexRebuild.keys()]),
+          ]);
+        } catch (err) {
+          post({ t: 'error', error: `index rebuild: ${String((err as Error)?.stack || err)}` });
+        }
+        if (gen !== transportGen) return;
+      }
+      postStatus(s);
+    });
+  };
   transport = factory(
     {
       run: (fn) => withWriteDb(() => fn(db)),
       committed: (tables, rows) => broadcastCommit(tables, rows),
-      status: postStatus,
+      status,
       log: (message) => post({ t: 'error', error: message }),
     },
     options
@@ -508,6 +531,7 @@ function stopSync(): void {
   if (!syncRunning) return;
   syncRunning = false;
   abort.abort();
+  transportGen++;
   transport?.stop();
   transport = null;
   postStatus({ state: 'paused' });
@@ -522,9 +546,17 @@ async function evaluatePause(): Promise<void> {
   else stopSync();
 }
 
+// The leader's latest status, replayed to tabs that open later (a broadcast
+// reaches only the tabs already listening).
+let leaderStatus: SyncStatus | null = null;
+const tabId = crypto.randomUUID();
+
 function postStatus(status: SyncStatus): void {
   post({ t: 'status', status });
-  if (isLeader) statusBc?.postMessage(status);
+  if (isLeader) {
+    leaderStatus = status;
+    statusBc?.postMessage(status);
+  }
 }
 
 async function init(config: WriterInit) {
@@ -597,8 +629,17 @@ async function init(config: WriterInit) {
   commits = new BroadcastChannel(commitChannel(config.dbName));
   statusBc = new BroadcastChannel(statusChannel(config.dbName));
   statusBc.onmessage = (e) => {
-    // Standby tabs relay the leader's status to their own client.
-    if (!isLeader) post({ t: 'status', status: e.data });
+    // A tab that just opened asks for the current status and the leader
+    // answers that tab alone (the others already have it). Standby tabs
+    // relay the leader's status to their own client.
+    const m = e.data as SyncStatus | { ask: string } | { to: string; status: SyncStatus };
+    if ('ask' in m) {
+      if (isLeader && leaderStatus) statusBc!.postMessage({ to: m.ask, status: leaderStatus });
+    } else if ('to' in m) {
+      if (!isLeader && m.to === tabId) post({ t: 'status', status: m.status });
+    } else if (!isLeader) {
+      post({ t: 'status', status: m });
+    }
   };
   visBc = new BroadcastChannel(visChannel(config.dbName));
   visBc.onmessage = () => void evaluatePause();
@@ -644,6 +685,7 @@ async function init(config: WriterInit) {
   });
   post({ t: 'ready', wiped, connMode });
   postStatus({ state: 'connecting' });
+  statusBc.postMessage({ ask: tabId });
 
   // Leadership: granted immediately in a single tab; otherwise this tab is
   // a standby until the current leader's tab closes. The callback promise
@@ -694,7 +736,7 @@ async function runShapeWithRetry(shape: WriterInit['shapes'][number]): Promise<v
     } catch (err) {
       post({ t: 'error', error: `shape ${shape.table}: ${String((err as Error)?.stack || err)}` });
       if (signal.aborted) return;
-      post({ t: 'status', status: { state: 'error', error: String(err), retryInMs: 5000 } });
+      postStatus({ state: 'error', error: String(err), retryInMs: 5000 });
       await new Promise((r) => setTimeout(r, 5000));
       if (signal.aborted) return;
     }
@@ -807,10 +849,7 @@ async function runShape(shape: WriterInit['shapes'][number], signal: AbortSignal
       cursor,
       signal: shapeAbort.signal,
       onRetry: (err, delayMs, httpStatus) =>
-        post({
-          t: 'status',
-          status: { state: 'error', error: String(err), retryInMs: delayMs, httpStatus },
-        }),
+        postStatus({ state: 'error', error: String(err), retryInMs: delayMs, httpStatus }),
     })) {
       if (batch.mustRefetch) {
         // A pending coalesced commit would persist a pre-refetch cursor over
@@ -847,10 +886,7 @@ async function runShape(shape: WriterInit['shapes'][number], signal: AbortSignal
       if (pendingRows >= MAX_BATCH_ROWS) {
         // Hydration chunk - commit immediately, never coalesce (latency to
         // first paint beats flush amortization here).
-        post({
-          t: 'status',
-          status: { state: 'initial-sync', table: shape.table, rows: pendingRows },
-        });
+        postStatus({ state: 'initial-sync', table: shape.table, rows: pendingRows });
         await commit(false, batch.cursor);
       } else if (batch.upToDate) {
         if (!liveOnce || (coalesceMs <= 0 && !alignEnabled)) {

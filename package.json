@@ -1,6 +1,6 @@
 {
   "name": "@nightride/localdb",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Reactive local-first SQLite for the browser: ElectricSQL shape sync into an OPFS-backed sqlite-wasm database, with worker read pools, live queries, and multi-tab support",
   "keywords": [
     "electric-sql",
